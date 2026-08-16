@@ -1,0 +1,462 @@
+
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Kaggriculture - Game Board</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { 
+            font-family: Arial, sans-serif; 
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: #333;
+            padding: 30px;
+            min-height: 100vh;
+        }
+        .container { max-width: 1400px; margin: 0 auto; }
+        h1 { text-align: center; color: white; margin-bottom: 30px; font-size: 2.5em; }
+        
+        .game-stats {
+            background: white;
+            border-radius: 10px;
+            padding: 20px;
+            margin-bottom: 30px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+            display: grid;
+            grid-template-columns: 1fr 1fr 1fr;
+            gap: 20px;
+        }
+        
+        .stat-box {
+            background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
+            padding: 15px;
+            border-radius: 8px;
+            text-align: center;
+        }
+        
+        .stat-value { font-size: 2em; font-weight: bold; color: #667eea; }
+        .stat-label { color: #666; font-size: 0.9em; margin-top: 5px; }
+        
+        .player-section {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 30px;
+            margin-bottom: 30px;
+        }
+        
+        .player-board {
+            background: white;
+            padding: 20px;
+            border-radius: 10px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        }
+        
+        .player-board h2 {
+            color: #667eea;
+            margin-bottom: 15px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        
+        .player-board.player-0 h2::before { content: "👨 "; }
+        .player-board.player-1 h2::before { content: "🧑 "; }
+        
+        .board {
+            border-collapse: collapse;
+            margin: 0 auto;
+            width: 100%;
+        }
+        
+        .tile {
+            width: 30px;
+            height: 30px;
+            border: 1px solid #ddd;
+            text-align: center;
+            font-size: 1.2em;
+            padding: 2px;
+        }
+        
+        .tile:hover {
+            background: #f0f0f0;
+            transform: scale(1.1);
+        }
+        
+        .inventory {
+            margin-top: 15px;
+            padding: 10px;
+            background: #f9f9f9;
+            border-radius: 5px;
+            font-size: 0.9em;
+        }
+        
+        .inventory h4 { color: #667eea; margin-bottom: 8px; }
+        
+        .emoji-legend {
+            background: white;
+            padding: 20px;
+            border-radius: 10px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 15px;
+        }
+        
+        .legend-item { display: flex; align-items: center; gap: 10px; }
+        .legend-emoji { font-size: 1.5em; }
+        
+        .market-info {
+            background: white;
+            padding: 20px;
+            border-radius: 10px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+            margin-top: 30px;
+        }
+        
+        .market-info h2 { color: #667eea; margin-bottom: 15px; }
+        
+        .price-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+            gap: 15px;
+        }
+        
+        .price-item {
+            background: linear-gradient(135deg, #ffeaa7 0%, #fdcb6e 100%);
+            padding: 12px;
+            border-radius: 6px;
+            text-align: center;
+            font-weight: bold;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🌾 Kaggriculture Game Board</h1>
+
+        <div class="game-stats">
+            <div class="stat-box">
+                <div class="stat-value">719/720</div>
+                <div class="stat-label">Turn Progress</div>
+            </div>
+            <div class="stat-box">
+                <div class="stat-value">Day 29</div>
+                <div class="stat-label">Current Day</div>
+            </div>
+            <div class="stat-box">
+                <div class="stat-value">Hour 23/23</div>
+                <div class="stat-label">Hour of Day</div>
+            </div>
+        </div>
+
+        <div class="player-section">
+
+            <div class="player-board player-0">
+                <h2>Player 0</h2>
+                <div style="color: #27ae60; font-size: 1.3em; margin-bottom: 10px;"><strong>$3384</strong></div>
+                <div style="font-size: 0.9em; color: #666; margin-bottom: 10px;">
+                    Unlocked: NW
+                </div>
+<table class='board'>
+  <tr>
+    <td class='tile'>🌿</td>
+    <td class='tile'>⬜</td>
+    <td class='tile'>⬜</td>
+    <td class='tile'>⬜</td>
+    <td class='tile'>🌿</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+  </tr>
+  <tr>
+    <td class='tile'>⬜</td>
+    <td class='tile'>⬜</td>
+    <td class='tile'>⬜</td>
+    <td class='tile'>⬜</td>
+    <td class='tile'>⬜</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+  </tr>
+  <tr>
+    <td class='tile'>⬜</td>
+    <td class='tile'>🌿</td>
+    <td class='tile'>⬜</td>
+    <td class='tile'>⬜</td>
+    <td class='tile'>⬜</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+  </tr>
+  <tr>
+    <td class='tile'>⬜</td>
+    <td class='tile'>⬜</td>
+    <td class='tile'>⬜</td>
+    <td class='tile'>⬜</td>
+    <td class='tile'>⬜</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+  </tr>
+  <tr>
+    <td class='tile'>⬜</td>
+    <td class='tile'>🌿</td>
+    <td class='tile'>⬜</td>
+    <td class='tile'>⬜</td>
+    <td class='tile'>👨 🌾</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+  </tr>
+  <tr>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+  </tr>
+  <tr>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+  </tr>
+  <tr>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+  </tr>
+  <tr>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+  </tr>
+  <tr>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+  </tr>
+</table>
+
+                <div class="inventory">
+<h4>📦 Shed: {'WHEAT': 0, 'CARROT': 0, 'TOMATO': 0, 'STRAWBERRY': 0, 'MELON': 0, 'EGG': 0, 'MILK': 0, 'WOOL': 0, 'FERTILIZER': 0, 'GOOSE': 0, 'COW': 0, 'SHEEP': 0}</h4><h4>🌱 Seeds: {'WHEAT': 1, 'CARROT': 0, 'TOMATO': 0, 'STRAWBERRY': 0, 'MELON': 0}</h4>
+                </div>
+            </div>
+
+            <div class="player-board player-1">
+                <h2>Player 1</h2>
+                <div style="color: #27ae60; font-size: 1.3em; margin-bottom: 10px;"><strong>$3384</strong></div>
+                <div style="font-size: 0.9em; color: #666; margin-bottom: 10px;">
+                    Unlocked: NW
+                </div>
+<table class='board'>
+  <tr>
+    <td class='tile'>⬜</td>
+    <td class='tile'>⬜</td>
+    <td class='tile'>⬜</td>
+    <td class='tile'>⬜</td>
+    <td class='tile'>⬜</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+  </tr>
+  <tr>
+    <td class='tile'>🌿</td>
+    <td class='tile'>⬜</td>
+    <td class='tile'>⬜</td>
+    <td class='tile'>⬜</td>
+    <td class='tile'>⬜</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+  </tr>
+  <tr>
+    <td class='tile'>⬜</td>
+    <td class='tile'>⬜</td>
+    <td class='tile'>⬜</td>
+    <td class='tile'>🌿</td>
+    <td class='tile'>🌿</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+  </tr>
+  <tr>
+    <td class='tile'>⬜</td>
+    <td class='tile'>⬜</td>
+    <td class='tile'>⬜</td>
+    <td class='tile'>⬜</td>
+    <td class='tile'>⬜</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+  </tr>
+  <tr>
+    <td class='tile'>⬜</td>
+    <td class='tile'>⬜</td>
+    <td class='tile'>⬜</td>
+    <td class='tile'>⬜</td>
+    <td class='tile'>👨 🌾</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+  </tr>
+  <tr>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+  </tr>
+  <tr>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+  </tr>
+  <tr>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+  </tr>
+  <tr>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+  </tr>
+  <tr>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+    <td class='tile'>🔒</td>
+  </tr>
+</table>
+
+                <div class="inventory">
+<p><em>Private info hidden (opponent)</em></p>
+                </div>
+            </div>
+
+        </div>
+        
+        <div class="emoji-legend">
+            <div class="legend-item"><span class="legend-emoji">⬜</span> <span>Empty</span></div>
+            <div class="legend-item"><span class="legend-emoji">🔒</span> <span>Locked Land</span></div>
+            <div class="legend-item"><span class="legend-emoji">🌾</span> <span>Wheat</span></div>
+            <div class="legend-item"><span class="legend-emoji">🥕</span> <span>Carrot</span></div>
+            <div class="legend-item"><span class="legend-emoji">🍅</span> <span>Tomato</span></div>
+            <div class="legend-item"><span class="legend-emoji">🍓</span> <span>Strawberry</span></div>
+            <div class="legend-item"><span class="legend-emoji">🍈</span> <span>Melon</span></div>
+            <div class="legend-item"><span class="legend-emoji">🦆</span> <span>Goose Coop</span></div>
+            <div class="legend-item"><span class="legend-emoji">🐄</span> <span>Cow</span></div>
+            <div class="legend-item"><span class="legend-emoji">🐑</span> <span>Sheep</span></div>
+            <div class="legend-item"><span class="legend-emoji">🌿</span> <span>Weed</span></div>
+            <div class="legend-item"><span class="legend-emoji">👨</span> <span>Farmer</span></div>
+            <div class="legend-item"><span class="legend-emoji">👶</span> <span>Farm Hand</span></div>
+        </div>
+
+        <div class="market-info">
+            <h2>💰 Market</h2>
+            <p><strong>Inventory:</strong> {'WHEAT': 9314, 'CARROT': 9934, 'TOMATO': 9934, 'STRAWBERRY': 9376, 'MELON': 9970, 'EGG': 9808, 'MILK': 9484, 'WOOL': 9754, 'FERTILIZER': 10000}</p>
+            <div class="price-grid">
+<div class='price-item'>WHEAT: $51</div>
+<div class='price-item'>CARROT: $40</div>
+<div class='price-item'>TOMATO: $68</div>
+<div class='price-item'>STRAWBERRY: $330</div>
+<div class='price-item'>MELON: $280</div>
+<div class='price-item'>EGG: $62</div>
+<div class='price-item'>MILK: $357</div>
+<div class='price-item'>WOOL: $247</div>
+<div class='price-item'>FERTILIZER: $100</div>
+
+            </div>
+        </div>
+        
+        <div class="market-info" style="margin-top: 20px;">
+            <h2>🏘️ Town</h2>
+            <p><strong>Active Shops:</strong> ICE_CREAM_SHOP, ICE_CREAM_SHOP, ICE_CREAM_SHOP, YARN_STORE, BAKERY, BRUNCH_SPOT, ICE_CREAM_SHOP, FARMERS_MARKET</p>
+        </div>
+    </div>
+</body>
+</html>
