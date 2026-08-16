@@ -5,3 +5,7 @@ __pycache__/
 .vscode/
 .DS_Store
 *.log
+__pycache__/
+*.pyc
+*.json
+*.html
