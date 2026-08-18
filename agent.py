@@ -1,417 +1,614 @@
 # submission.py
-from kaggle_environments.envs.kaggriculture.kaggriculture import CROPS, PRODUCTS
+from kaggle_environments.envs.kaggriculture.kaggriculture import CROPS, PRODUCTS, ANIMALS, MARKET_PARAMS
 
 # Global counter to track steps (for logging)
 step_counter = 0
-DEBUG = True  # Set to False to disable debug output
+DEBUG = False  # Set to True to enable debug output
+
+# Board geometry (default 10x10). The shed sits at the center; its four
+# orthogonally-adjacent access tiles are (4,4) (5,4) (4,5) (5,5).
+HALF = 5
+SHED_TILES = [(HALF - 1, HALF - 1), (HALF, HALF - 1), (HALF - 1, HALF), (HALF, HALF)]
+MAX_MARKET_ORDERS = 10
+SEASON = 30  # days 0..29 (0-indexed)
+
+BUY_WHEAT_TOP = 15      # max feed-wheat units bought per turn
+MAX_ANIMALS = 6         # max animals on farm + shed combined
+
 
 def log(*args):
-    """Helper to print debug statements easily, controlled by the DEBUG flag."""
+    """Debug output controlled by DEBUG."""
     if DEBUG:
         print(f"[Agent Log]", *args)
 
 
 class GameState:
-    """Helper class to parse and query the observation dictionary."""
+    """Parses and queries the observation using the real game schema.
+
+    Key schema notes (see kaggriculture.py):
+      - plant tiles use 'crop' (not 'type')
+      - 'animal' on a structure is a STRING (e.g. "GOOSE"); empty structures
+        (no 'animal' key) hold no produce and need no care/feed
+      - fertilizer state is 'fertilized_until_day' (int, -1 when inactive)
+      - 'yield_units' accumulates on the tile; harvested into worker inventory
+      - day is 0-indexed (0..29)
+    """
     def __init__(self, obs):
         self.obs = obs
-        self.day = obs.get("day", 1)
+        self.day = obs.get("day", 0)
         self.player_id = obs["player"]
         self.me = obs["farms"][self.player_id]
         self.private = obs["private"]
         self.tiles = self.me["tiles"]
+        self.market = obs.get("market", {})
+        self.money = self.me["money"]
+        self.shed = self.private.get("shed", {})
+        self.seeds = self.private.get("seeds", {})
+        self.inventories = self.private.get("inventories", [{}])
 
-    def get_thirsty_plants(self):
-        """Returns a list of (x, y, tile) for plants that need watering today."""
-        thirsty = []
-        for y, row in enumerate(self.tiles):
-            for x, tile in enumerate(row):
-                if isinstance(tile, dict) and tile.get("kind") == "PLANT":
-                    if not tile.get("watered_today", False):
-                        thirsty.append((x, y, tile))
-        return thirsty
-
-    def get_harvestable_tiles(self):
-        """Returns lists of high-value harvests and normal harvests: (high_value, normal)"""
-        high_value = []
-        normal = []
+    # ---------------- tile helpers ----------------
+    def _iter_dict_tiles(self):
         for y, row in enumerate(self.tiles):
             for x, tile in enumerate(row):
                 if isinstance(tile, dict):
-                    if tile.get("kind") == "PLANT":
-                        crop_age = self.day - tile.get("planted_day", self.day)
-                        plant_type = tile.get("type", "WHEAT")
-                        
-                        first_yield = CROPS.get(plant_type, {}).get("first_yield_day", 2)
-                        max_yield = CROPS.get(plant_type, {}).get("max_yield_day", 4)
-                        
-                        if crop_age >= max_yield:
-                            high_value.append((x, y, tile, "HARVEST"))
-                        elif crop_age >= first_yield:
-                            normal.append((x, y, tile, "HARVEST"))
-                    elif tile.get("kind") in ["COOP", "PASTURE"]:
-                        yield_units = tile.get("yield_units", 0)
-                        if "animal" in tile and isinstance(tile["animal"], dict):
-                            yield_units = tile["animal"].get("yield_units", 0)
-                        if yield_units > 0:
-                            high_value.append((x, y, tile, "HARVEST"))
-                            
-        return high_value, normal
+                    yield x, y, tile
 
-    def get_critical_care_tiles(self):
-        """Priority 1: Survival. Plants unfed=1, animals unfed=1"""
-        critical = []
-        for y, row in enumerate(self.tiles):
-            for x, tile in enumerate(row):
-                if isinstance(tile, dict):
-                    if tile.get("kind") == "PLANT":
-                        if tile.get("consecutive_unwatered", 0) == 1 and not tile.get("watered_today", False):
-                            critical.append((x, y, tile, "WATER"))
-                    elif tile.get("kind") in ["COOP", "PASTURE"]:
-                        unfed = tile.get("consecutive_unfed", 0)
-                        fed_today = tile.get("fed_today", False)
-                        if "animal" in tile and isinstance(tile["animal"], dict):
-                            unfed = tile["animal"].get("consecutive_unfed", 0)
-                            fed_today = fed_today or tile["animal"].get("fed_today", False)
-                            
-                        if unfed == 1 and not fed_today:
-                            critical.append((x, y, tile, "FEED"))
-        return critical
+    def plants(self):
+        return [(x, y, t) for x, y, t in self._iter_dict_tiles() if t.get("kind") == "PLANT"]
 
-    def get_maintenance_tiles(self):
-        """Priority 3: Maintenance. Rest of unwatered plants and unfed animals."""
-        maintenance = []
-        for y, row in enumerate(self.tiles):
-            for x, tile in enumerate(row):
-                if isinstance(tile, dict):
-                    if tile.get("kind") == "PLANT":
-                        if not tile.get("watered_today", False):
-                            maintenance.append((x, y, tile, "WATER"))
-                    elif tile.get("kind") in ["COOP", "PASTURE"]:
-                        fed_today = tile.get("fed_today", False)
-                        if "animal" in tile and isinstance(tile["animal"], dict):
-                            fed_today = fed_today or tile["animal"].get("fed_today", False)
-                        if not fed_today:
-                            maintenance.append((x, y, tile, "FEED"))
-        return maintenance
+    def animals(self):
+        return [(x, y, t) for x, y, t in self._iter_dict_tiles()
+                if t.get("kind") in ("COOP", "PASTURE") and "animal" in t]
 
-    def get_care_and_fertilize_tiles(self):
-        """Priority 4: Animal CARE and crop FERTILIZE."""
-        care = []
-        for y, row in enumerate(self.tiles):
-            for x, tile in enumerate(row):
-                if isinstance(tile, dict):
-                    if tile.get("kind") in ["COOP", "PASTURE"]:
-                        cared = tile.get("cared_today", False)
-                        if "animal" in tile and isinstance(tile["animal"], dict):
-                            cared = cared or tile["animal"].get("cared_today", False)
-                        if not cared:
-                            care.append((x, y, tile, "CARE"))
-                    elif tile.get("kind") == "PLANT":
-                        # Fertilize high value crops if we have fertilizer?
-                        # Simplification: Assume we just FERTILIZE if we have the item, we'll queue the task.
-                        # Actually, agent needs to know if we have fertilizer. We'll queue it anyway.
-                        if not tile.get("fertilized_today", False):
-                            # Only high value crops: MELON, STRAWBERRY
-                            if tile.get("type") in ["MELON", "STRAWBERRY"]:
-                                care.append((x, y, tile, "FERTILIZE"))
-        return care
+    def empty_structures(self):
+        return [(x, y, t) for x, y, t in self._iter_dict_tiles()
+                if t.get("kind") in ("COOP", "PASTURE") and "animal" not in t]
 
-    def get_empty_tiles(self):
-        """Priority 5: Empty tiles."""
-        empty = []
-        for y, row in enumerate(self.tiles):
-            for x, tile in enumerate(row):
-                if tile is None:
-                    empty.append((x, y))
-        return empty
+    def weeds(self):
+        return [(x, y) for x, y, t in self._iter_dict_tiles() if t.get("kind") == "WEED"]
+
+    def empty_tiles(self):
+        return [(x, y) for y, row in enumerate(self.tiles) for x, tile in enumerate(row)
+                if tile is None]
+
+    def age(self, tile):
+        return self.day - tile.get("planted_day", self.day)
+
+    # ---------------- derived state ----------------
+    def harvestable_plants(self):
+        out = []
+        for x, y, t in self.plants():
+            crop = t.get("crop", "WHEAT")
+            cd = CROPS[crop]
+            a = self.age(t)
+            if cd["ongoing"]:
+                # Ongoing crops produce on scheduled days; harvest whenever
+                # there is accumulated produce.
+                if a >= cd["first_yield_day"] and t.get("yield_units", 0) > 0:
+                    out.append((x, y))
+            else:
+                # One-time crops: harvest once yield has peaked. The cap can be
+                # reached before max_yield_day (e.g. fertilized melon at age 8
+                # vs max_yield_day 12) — freeing the tile early is pure win.
+                if a >= cd["max_yield_day"] or t.get("yield_units", 0) >= cd["max_yield"]:
+                    out.append((x, y))
+        return out
+
+    def harvestable_animals(self):
+        return [(x, y) for x, y, t in self.animals() if t.get("yield_units", 0) > 0]
+
+    def fertilize_candidates(self):
+        """Crops where fertilizer still adds yield and none is active.
+
+        One-time crops: while inside the watering bonus window.
+        Ongoing crops: while at least one scheduled production day remains
+        inside the 3-day fertilizer window (fertilized+watered productions
+        yield 2 instead of 1).
+        """
+        out = []
+        for x, y, t in self.plants():
+            crop = t.get("crop", "WHEAT")
+            cd = CROPS[crop]
+            if t.get("fertilized_until_day", -1) >= self.day:
+                continue
+            a = self.age(t)
+            if cd["ongoing"]:
+                # Last scheduled production day for ongoing crops.
+                last_yield_day = cd["first_yield_day"] + cd["interval"] * (cd["max_yield"] - 1)
+                # Fertilizing at age a covers productions on days a..a+2; only
+                # useful if at least one production day falls inside.
+                if a + 2 >= cd["first_yield_day"] and a < last_yield_day:
+                    if a >= max(0, cd["first_yield_day"] - 2):
+                        out.append((x, y))
+            else:
+                window_start = (cd["max_yield_day"] + 1) // 2
+                if window_start <= a <= cd["max_yield_day"]:
+                    out.append((x, y))
+        return out
+
+    def animals_on_farm(self):
+        return len(self.animals())
+
+    def animals_in_shed(self):
+        return sum(self.shed.get(a, 0) for a in ANIMALS)
+
+    def total_shed_items(self):
+        return sum(v for k, v in self.shed.items() if k in PRODUCTS)
+
+    def worker_inventory(self, worker_idx):
+        if 0 <= worker_idx < len(self.inventories):
+            d = self.inventories[worker_idx]
+            return d if isinstance(d, dict) else {}
+        return {}
 
 
 def manhattan_distance(pos1, pos2):
     return abs(pos1[0] - pos2[0]) + abs(pos1[1] - pos2[1])
 
-def get_closest_worker(target_pos, workers_dict):
-    """
-    Finds the closest worker to a target position.
-    workers_dict: dict of {worker_id: (x, y)}
-    Returns: closest_worker_id
-    """
-    closest_worker = None
-    min_dist = float('inf')
-    
-    for worker_id, pos in workers_dict.items():
-        dist = manhattan_distance(pos, target_pos)
-        if dist < min_dist:
-            min_dist = dist
-            closest_worker = worker_id
-            
-    return closest_worker
 
 def move_towards(current_pos, target_pos):
     """Returns the next movement action to reach target_pos."""
     cx, cy = current_pos
     tx, ty = target_pos
-    if cx < tx: return "EAST"
-    if cx > tx: return "WEST"
-    if cy < ty: return "SOUTH"
-    if cy > ty: return "NORTH"
+    if cx < tx:
+        return "EAST"
+    if cx > tx:
+        return "WEST"
+    if cy < ty:
+        return "SOUTH"
+    if cy > ty:
+        return "NORTH"
     return None
+
+
+def closest_shed_tile(pos):
+    return min(SHED_TILES, key=lambda s: manhattan_distance(pos, s))
+
+
+def get_closest_worker(target_pos, workers_dict):
+    """Returns the id of the closest available worker to target_pos."""
+    best, best_d = None, float("inf")
+    for wid, pos in workers_dict.items():
+        d = manhattan_distance(pos, target_pos)
+        if d < best_d:
+            best, best_d = wid, d
+    return best
+
+
+def build_market(state):
+    """Construct market orders; returns up to MAX_MARKET_ORDERS orders."""
+    day = state.day
+    shed = state.shed
+    money = float(state.money)
+
+    unlocked = len(state.me["unlocked_quadrants"])
+    empty_n = len(state.empty_tiles())
+    weeds_n = len(state.weeds())
+    seed_count = sum(state.seeds.values())
+
+    # On the final day, liquidate everything — produce left in the shed after
+    # the season ends earns nothing. Days 28 still needs the feed/fertilizer
+    # reserves: feeding 1 wheat → ~1 egg (still profitable), and fertilizer
+    # still adds yield to plants in their bonus window.
+    endgame = day >= 29
+
+    # Reserve wheat for animal feed (1 wheat/day per animal), except in the
+    # endgame when keeping wheat instead of selling it earns nothing.
+    animals_n = state.animals_on_farm()
+    wheat_reserve = 0 if endgame else animals_n
+    shed_wheat = shed.get("WHEAT", 0)
+    sellable_wheat = max(0, shed_wheat - wheat_reserve)
+
+    # Reserve a little fertilizer for crops that are ready for it.
+    fert_candidates = len(state.fertilize_candidates())
+    fert_reserve = 0 if endgame else (3 if fert_candidates > 0 else 0)
+
+    orders = []
+
+    # ---- SELL (economy products first so we have money for buys this turn) ----
+    sell_candidates = [
+        ("FERTILIZER", max(0, shed.get("FERTILIZER", 0) - fert_reserve)),
+        ("CARROT", shed.get("CARROT", 0)),
+        ("TOMATO", shed.get("TOMATO", 0)),
+        ("EGG", shed.get("EGG", 0)),
+        ("WHEAT", sellable_wheat),
+        ("STRAWBERRY", shed.get("STRAWBERRY", 0)),
+        ("MELON", shed.get("MELON", 0)),
+        ("MILK", shed.get("MILK", 0)),
+        ("WOOL", shed.get("WOOL", 0)),
+    ]
+    for product, qty in sell_candidates:
+        if qty <= 0:
+            continue
+        # Sell immediately. Premium goods (MELON/STRAWBERRY/MILK/WOOL) crash to
+        # the $1 floor quickly once a glut forms, and our own bulk sale is the
+        # main glut source — selling ASAP at the still-healthy price beats
+        # holding and waiting for a recovery that our production prevents.
+        orders.append(["SELL", product, qty])
+
+    # ---- BUY-side orders (hires, land, seeds, animals) are gated to hour==0
+    # (the day's first turn). The market processes orders every turn, so without
+    # this gate we'd buy 24x/day and drain cash instantly. BUY_PRODUCT wheat is
+    # exempt (handled above) because feed wheat must be replenished promptly.
+    hour = state.obs.get("hour", 0)
+
+    # ---- BUY_PRODUCT wheat for animal feed (animals must eat) ----
+    # NOT gated to hour 0: shedding wheat below the reserve must be replenished
+    # promptly or animals starve. Self-limiting: only fires when wheat is below
+    # the daily feed reserve, and caps at BUY_WHEAT_TOP per turn.
+    if wheat_reserve > 0 and shed_wheat < wheat_reserve:
+        need = min(wheat_reserve - shed_wheat, BUY_WHEAT_TOP)
+        # Quote against the real observed price, not the $25 base, so a scarce
+        # market (wheat at $40+) doesn't blow the budget.
+        wheat_price = max(1, int(state.market.get("prices", {}).get("WHEAT", 25)))
+        cost = wheat_price * need
+        if money >= cost:
+            orders.append(["BUY_PRODUCT", "WHEAT", need])
+            money -= cost
+
+    # ---- HIRE farm hands (day-hire; very cheap, reset each day) ----
+    # Cost = fib(n) for the n-th hire today (1,1,2,3,5,...). Each hand adds up
+    # to 24 actions/day, so 3-4 hands are easily profitable once the farm grows.
+    if hour == 0 and 1 <= day <= 24 and money > 50:
+        have_hands = len(state.me["hands"])
+        target = 2 if day < 3 else 3 if day < 12 else 4
+        need = max(0, target - have_hands)
+        for i in range(need):
+            hire_idx = have_hands + i
+            cost = [1, 1, 2, 3, 5][hire_idx] if hire_idx < 5 else 8
+            if money >= cost:
+                orders.append(["HIRE"])
+                money -= cost
+
+    # ---- BUY_LAND ----
+    # Deliberately NOT gated to hour 0: `money >= land_cost + 500` self-limits
+    # the spend, and unlocking quadrants earlier gives far more planting room
+    # (5x5=25 tiles each). Buying the next quadrant as soon as it's affordable
+    # massively outweighs the small risk of overspending once.
+    land_cost = {1: 1000, 2: 2000, 3: 4000}.get(unlocked, float("inf"))
+    # Late-season land is still productive with fast wheat (buy day 24, plant
+    # immediately, harvest day 29), so keep buying through day 24.
+    if unlocked < 4 and empty_n <= 4 and day <= 24 and money >= land_cost + 500:
+        orders.append(["BUY_LAND"])
+        money -= land_cost
+
+    # ---- BUY_SEED (only plant what we have room for) ----
+    # Self-limiting: buy when seeds are low relative to empty tiles. Not strictly
+    # hour-gated because 3 workers planting 1 seed/turn burn up to 72 seeds/day;
+    # hour-0-only restocking starves them and idles tiles. `need_seeds` bounds
+    # the order to what could actually be planted.
+    # Weeds get dug (P3) and become plantable the same day, so count them
+    # toward the seed requirement too — otherwise we'd run out of seeds right
+    # after clearing.
+    need_seeds = max(0, empty_n + weeds_n - seed_count)
+    hands_n = len(state.me["hands"])
+    # Restock when we have less than 1 hour of work per worker (workers each
+    # plant 1 seed/turn), plus a small buffer. This keeps tiles planted all day
+    # without the degenerate 24x/day buying that hoards unusable seeds.
+    seed_burn = hands_n + 1  # farmer + hired hands
+    seed_threshold = max(2 * seed_burn, 4)
+    if seed_count < seed_threshold and need_seeds > 0 and day <= 26:
+        if day <= 7:  # Early: wheat + carrot
+            wn = min(need_seeds, 20)
+            if money >= wn * 10:
+                orders.append(["BUY_SEED", "WHEAT", wn]); money -= wn * 10
+            cn = min(max(0, need_seeds - wn), 10)
+            if cn > 0 and money >= cn * 20:
+                orders.append(["BUY_SEED", "CARROT", cn]); money -= cn * 20
+        elif day <= 17:  # Mid: wheat + tomato (tomato needs 8 days to first yield)
+            wn = min(need_seeds, 20)
+            if money >= wn * 10:
+                orders.append(["BUY_SEED", "WHEAT", wn]); money -= wn * 10
+            tn = min(max(0, need_seeds - wn), 10)
+            if tn > 0 and money >= tn * 50:
+                orders.append(["BUY_SEED", "TOMATO", tn]); money -= tn * 50
+        elif day <= 19 and hour == 0:  # Melon window (day 18-19): melon needs 10 days
+            # Hour-gated: otherwise the env buys 1 melon EVERY hour of both
+            # days (24x/day at $80 each) — a huge cash drain.
+            if need_seeds > 0 and money >= 80:
+                orders.append(["BUY_SEED", "MELON", 1]); money -= 80
+        elif day <= 26:  # Late: fast crops only
+            wn = min(need_seeds, 20)
+            if money >= wn * 10:
+                orders.append(["BUY_SEED", "WHEAT", wn]); money -= wn * 10
+
+    # ---- BUY_ANIMAL (max 6 total; 1/day while in the mid-game window) ----
+    # Geese produce daily once placed, and CARE doubles output. A goose bought
+    # day 8 clears its $300 cost by ~day 18; six is a good balance between
+    # income and the wheat feeding burden.
+    if hour == 0 and 8 <= day <= 18:
+        on_farm = state.animals_on_farm()
+        in_shed = state.animals_in_shed()
+        if on_farm + in_shed < MAX_ANIMALS and money >= 350:
+            orders.append(["BUY_ANIMAL", "GOOSE", 1])
+            money -= 300
+
+    # The env silently drops orders past maxMarketOrdersPerTurn.
+    return orders[:MAX_MARKET_ORDERS]
+
 
 def agent(obs):
     global step_counter
     step_counter += 1
-    log(f"--- Step {step_counter} --- Day {obs.get('day', '?')} ---")
-    
     state = GameState(obs)
-    
-    # Market & Phase Logic
-    market = []
-    day = state.day
-    money = state.me["money"]
-    shed = state.private.get("shed", {})
-    seeds = state.private.get("seeds", {})
-    empty_tiles_count = len(state.get_empty_tiles())
-    unlocked_quads = len(state.me["unlocked_quadrants"])
-    
-    # Current seeds count (excluding fertilizer)
-    current_seeds = sum(v for k, v in seeds.items() if k != "FERTILIZER")
-    seeds_to_buy = max(0, empty_tiles_count + 5 - current_seeds)
-    
-    # Sell harvested products
-    for item, qty in shed.items():
-        if item in ["GOOSE", "COW", "SHEEP", "FERTILIZER"]:
-            if day >= 26:  # Liquidate in end game
-                market.append(["SELL", item, qty])
+    log(f"--- Step {step_counter} | Day {state.day} | Money {state.money:.0f} ---")
+
+    market = build_market(state)
+
+    hands_n = len(state.me["hands"])
+    unassigned = {"farmer": list(state.me["farmer"])}
+    for i, pos in enumerate(state.me["hands"]):
+        unassigned[f"hand_{i}"] = list(pos)
+
+    actions = {"farmer": None, "hands": [None] * hands_n}
+
+    def worker_index(wid):
+        return 0 if wid == "farmer" else int(wid.split("_")[1]) + 1
+
+    def inventory_of(wid):
+        return state.worker_inventory(worker_index(wid))
+
+    def assign(wid, action):
+        if wid == "farmer":
+            actions["farmer"] = action
         else:
-            if qty > 0:
-                market.append(["SELL", item, qty])
+            idx = int(wid.split("_")[1])
+            actions["hands"][idx] = action
+        unassigned.pop(wid, None)
 
-    if day <= 8:
-        # Early Game: Fast Cash
-        land_cost = 1000 * (2 ** (unlocked_quads - 1)) if unlocked_quads < 4 else float('inf')
-        # Target seed cost ~15. Buffer = 25 * 15 = 375
-        if empty_tiles_count <= 2 and money >= land_cost + 375:
-            market.append(["BUY_LAND"])
-            money -= land_cost
-            
-        wheat_to_buy = seeds_to_buy // 2
-        carrot_to_buy = seeds_to_buy - wheat_to_buy
-        if wheat_to_buy > 0 and money >= wheat_to_buy * 10:
-            market.append(["BUY_SEED", "WHEAT", wheat_to_buy])
-            money -= wheat_to_buy * 10
-        if carrot_to_buy > 0 and money >= carrot_to_buy * 20:
-            market.append(["BUY_SEED", "CARROT", carrot_to_buy])
-            money -= carrot_to_buy * 20
-
-    elif day <= 20:
-        # Mid Game: High Yield & Animals
-        land_cost = 1000 * (2 ** (unlocked_quads - 1)) if unlocked_quads < 4 else float('inf')
-        if empty_tiles_count <= 2 and money >= land_cost + 500: # Slightly larger buffer for Mid Game
-            market.append(["BUY_LAND"])
-            money -= land_cost
-
-        # Animal capacity cap (40% of land)
-        total_land = unlocked_quads * 25
-        animal_cap = int(0.4 * total_land)
-        
-        existing_animals = sum(
-            1 for row in state.tiles for tile in row 
-            if isinstance(tile, dict) and tile.get("kind") in ["COOP", "PASTURE"]
-        )
-        animals_in_shed = sum(v for k,v in shed.items() if k in ["GOOSE", "COW", "SHEEP"])
-        total_animals = existing_animals + animals_in_shed
-        
-        if total_animals < animal_cap and money >= 500:
-            market.append(["BUY_ANIMAL", "GOOSE", 1]) # Max 1 animal per day
-            money -= 500
-            
-        tomato_to_buy = seeds_to_buy // 2
-        strawberry_to_buy = seeds_to_buy - tomato_to_buy
-        if tomato_to_buy > 0 and money >= tomato_to_buy * 20:
-            market.append(["BUY_SEED", "TOMATO", tomato_to_buy])
-            money -= tomato_to_buy * 20
-        if strawberry_to_buy > 0 and money >= strawberry_to_buy * 30:
-            market.append(["BUY_SEED", "STRAWBERRY", strawberry_to_buy])
-            money -= strawberry_to_buy * 30
-
-    elif day <= 25:
-        # Late Game: Quick Turnarounds
-        melon_to_buy = seeds_to_buy // 2
-        wheat_to_buy = seeds_to_buy - melon_to_buy
-        if melon_to_buy > 0 and money >= melon_to_buy * 50:
-            market.append(["BUY_SEED", "MELON", melon_to_buy])
-            money -= melon_to_buy * 50
-        if wheat_to_buy > 0 and money >= wheat_to_buy * 10:
-            market.append(["BUY_SEED", "WHEAT", wheat_to_buy])
-            money -= wheat_to_buy * 10
-
-    else:
-        # End Game: Liquidation
-        pass # Only selling, handled above
-
-    # Gather available workers
-    unassigned_workers = {"farmer": state.me["farmer"]}
-    for i, hand in enumerate(state.me["hands"]):
-        unassigned_workers[f"hand_{i}"] = hand
-        
-    worker_actions = {"farmer": ["PASS"], "hands": [["PASS"] for _ in state.me["hands"]]}
-    
-    def assign_worker(worker_id, action):
-        if worker_id == "farmer":
-            worker_actions["farmer"] = action
+    def assign_task(task):
+        """Assign one task (type, pos, requires, args) to the closest free worker.
+        If the worker is missing a required inventory item, route them to the shed
+        to PICKUP first; their inventory persists, so they complete the task on a
+        later turn once they have the item."""
+        if not unassigned:
+            return
+        typ, pos, requires, args = task
+        if requires:
+            # Prefer a worker already carrying the required item to avoid a
+            # shed round-trip.
+            holders = [wid for wid in unassigned if inventory_of(wid).get(requires, 0) > 0]
+            wid = (min(holders, key=lambda w: manhattan_distance(unassigned[w], pos))
+                   if holders else get_closest_worker(pos, unassigned))
         else:
-            idx = int(worker_id.split("_")[1])
-            worker_actions["hands"][idx] = action
-        del unassigned_workers[worker_id]
+            wid = get_closest_worker(pos, unassigned)
+        if wid is None:
+            return
+        wpos = unassigned[wid]
+        inv = inventory_of(wid)
+        has_req = requires is None or inv.get(requires, 0) > 0
 
+        if list(wpos) == list(pos) and has_req:
+            assign(wid, [typ] + (args or []))
+        elif requires and not has_req:
+            # Worker needs the required item from the shed before acting.
+            shed_pos = closest_shed_tile(wpos)
+            if list(wpos) == list(shed_pos):
+                assign(wid, ["PICKUP", requires, 5])
+            else:
+                m = move_towards(wpos, shed_pos)
+                assign(wid, [m] if m else ["PASS"])
+        else:
+            m = move_towards(wpos, pos)
+            assign(wid, [m] if m else ["PASS"])
+
+    # Build the task queue by priority.
+    # Each entry: (type, [x, y], requires_inventory_item, args)
     tasks = []
-    queued_positions = set()
-    
-    def enqueue_tasks(tile_list, default_args=None):
-        for x, y, tile, action_type in tile_list:
-            if (x, y) not in queued_positions:
-                tasks.append({"type": action_type, "pos": [x, y], "args": default_args or []})
-                queued_positions.add((x, y))
 
-    high_value_harvests, normal_harvests = state.get_harvestable_tiles()
+    # Track tiles already queued so P1 and P4 don't both schedule the same
+    # water/feed (actions only become visible in the next observation).
+    water_queued = set()
+    feed_queued = set()
 
-    # Priority 1: Survival (Emergency)
-    enqueue_tasks(state.get_critical_care_tiles())
-    
-    # Priority 2: High-Value Harvests
-    enqueue_tasks(high_value_harvests)
-    
-    # Priority 3: Maintenance
-    enqueue_tasks(state.get_maintenance_tiles())
-    
-    # Priority 2.5: Normal Harvests (Insert here before Care)
-    enqueue_tasks(normal_harvests)
-    
-    # Priority 4: Animal Care & Fertilization
-    if state.private.get("shed", {}).get("FERTILIZER", 0) > 0 or state.private.get("seeds", {}).get("FERTILIZER", 0) > 0:
-        # Assuming FERTILIZER might be in shed or inventory. Just queuing it.
-        pass
-    enqueue_tasks(state.get_care_and_fertilize_tiles())
-    
-    # Priority 5: Planting/Building
-    if day <= 25 and unassigned_workers:
-        available_seeds = []
-        for seed_type, qty in seeds.items():
-            if seed_type != "FERTILIZER":
-                available_seeds.extend([seed_type] * qty)
-                
-        empty_tiles = [
-            (x, y) for x, y in state.get_empty_tiles() 
-            if (x, y) not in queued_positions
-        ]
+    # P1: Critical survival — plants one missed day from becoming weeds,
+    #     animals one missed day from escaping.
+    for x, y, t in state.plants():
+        if not t.get("watered_today", False) and t.get("consecutive_unwatered", 0) >= 1:
+            tasks.append(("WATER", [x, y], None, []))
+            water_queued.add((x, y))
+    for x, y, t in state.animals():
+        if not t.get("fed_today", False) and t.get("consecutive_unfed", 0) >= 1:
+            tasks.append(("FEED", [x, y], "WHEAT", []))
+            feed_queued.add((x, y))
 
-        for worker_id in list(unassigned_workers.keys()):
-            if not available_seeds or not empty_tiles:
+    # P2: Harvest ripe plants and animals with accumulated produce.
+    for x, y in state.harvestable_plants():
+        tasks.append(("HARVEST", [x, y], None, []))
+    for x, y in state.harvestable_animals():
+        tasks.append(("HARVEST", [x, y], None, []))
+
+    # P3: Clear weeds so the land can be planted again.
+    for x, y in state.weeds():
+        tasks.append(("DIG", [x, y], None, []))
+
+    # P4: Daily upkeep that adds yield value.
+    #   - One-time crops: water only inside their bonus window and only if
+    #     watering still adds yield (yield_units below the cap). Plants past
+    #     the window are at max yield already — watering wastes a worker turn
+    #     (their survival needs are covered by P1).
+    #   - Ongoing crops (tomato/strawberry): watering only boosts yield while
+    #     fertilized (fertilized+watered production days yield 2 instead of 1).
+    #     Unfertilized ongoing watering is survival-only → P1.
+    #   - Animals: feed the remainder, CARE every animal (banks +1 to the next
+    #     production), and collect the free fertilizer.
+    for x, y, t in state.plants():
+        if (x, y) in water_queued or t.get("watered_today", False):
+            continue
+        crop = t.get("crop", "WHEAT")
+        cd = CROPS[crop]
+        if cd["ongoing"]:
+            if t.get("fertilized_until_day", -1) >= state.day:
+                tasks.append(("WATER", [x, y], None, []))
+        else:
+            a = state.age(t)
+            window_start = (cd["max_yield_day"] + 1) // 2
+            if window_start <= a <= cd["max_yield_day"]:
+                if t.get("yield_units", 0) < cd["max_yield"]:
+                    tasks.append(("WATER", [x, y], None, []))
+    for x, y, t in state.animals():
+        if not t.get("fed_today", False) and (x, y) not in feed_queued:
+            tasks.append(("FEED", [x, y], "WHEAT", []))
+    for x, y, t in state.animals():
+        if not t.get("cared_today", False):
+            tasks.append(("CARE", [x, y], None, []))
+        if t.get("fertilizer_available", False):
+            tasks.append(("COLLECT_FERTILIZER", [x, y], None, []))
+
+    # P5: Crop FERTILIZE (if we have some).
+    if state.shed.get("FERTILIZER", 0) > 0:
+        for x, y in state.fertilize_candidates():
+            tasks.append(("FERTILIZE", [x, y], "FERTILIZER", []))
+
+    # P6: Animal logistics — build coops and place animals waiting in the shed.
+    waiting_animals = state.animals_in_shed()
+    if waiting_animals > 0:
+        free_coops = [(x, y, t) for x, y, t in state.empty_structures() if t.get("kind") == "COOP"]
+        if not free_coops:
+            empty = state.empty_tiles()
+            if empty:
+                # Build one coop per waiting goose (up to 2/turn) so a backlog
+                # doesn't keep animals in the shed for days.
+                build_targets = sorted(empty, key=lambda p: manhattan_distance(p, (HALF - 1, HALF - 1)))
+                for _ in range(min(waiting_animals, 2, len(build_targets))):
+                    p = build_targets.pop(0)
+                    tasks.append(("BUILD_COOP", list(p), None, []))
+        else:
+            # Only emit as many PLACE tasks as there are animals waiting.
+            for (x, y, t) in free_coops[:waiting_animals]:
+                tasks.append(("PLACE", [x, y], "GOOSE", ["GOOSE"]))
+
+    # P7: Plant seeds (only crops that still have time to mature by day 29).
+    # Day 27 wheat/carrot still produce a harvest by day 29.
+    if state.day <= 27:
+        plantable = [(c, n) for c, n in state.seeds.items() if n > 0
+                     and SEASON - state.day >= CROPS[c]["first_yield_day"]]
+        seed_pool = []
+        for crop, n in plantable:
+            seed_pool.extend([crop] * n)
+
+        empty = state.empty_tiles()
+        # Don't plant on tiles reserved for higher-priority building tasks.
+        for (typ, pos, _, _) in tasks:
+            if typ in ("BUILD_COOP", "BUILD_PASTURE") and tuple(pos) in empty:
+                empty.remove(tuple(pos))
+        for pos in empty:
+            if not seed_pool:
                 break
-                
-            worker_pos = unassigned_workers[worker_id]
-            # Find the unassigned empty tile nearest to this specific worker
-            closest_tile = min(empty_tiles, key=lambda pos: manhattan_distance(worker_pos, pos))
-            
-            seed_to_plant = available_seeds.pop(0)
-            empty_tiles.remove(closest_tile)
-            queued_positions.add(closest_tile)
-            
-            if list(closest_tile) == worker_pos:
-                assign_worker(worker_id, ["PLANT", seed_to_plant])
+            crop = seed_pool.pop(0)
+            tasks.append(("PLANT", list(pos), None, [crop]))
+
+    # P8: Inventory management — large inventories need DROPping at the shed
+    #     so harvested goods can be sold from the shed.
+    for wid in list(unassigned.keys()):
+        inv = inventory_of(wid)
+        total = sum(inv.values()) if inv else 0
+        if total >= 15:
+            shed_pos = closest_shed_tile(unassigned[wid])
+            if list(unassigned[wid]) == list(shed_pos):
+                assign(wid, ["DROP"])
             else:
-                move = move_towards(worker_pos, closest_tile)
-                if move:
-                    assign_worker(worker_id, [move])
-                else:
-                    assign_worker(worker_id, ["PASS"])
+                m = move_towards(unassigned[wid], shed_pos)
+                assign(wid, [m] if m else ["PASS"])
 
-    # Priority 6: Logistics (Shed)
-    # If unassigned workers exist, send them to the shed to wait/drop off.
-    # Shed is at center. Assuming boardSize=10, tiles (4,4), (5,4), (4,5), (5,5) are adjacent.
-    shed_positions = [(4,4), (5,4), (4,5), (5,5)]
-    # We will just append a generic DROP task at (4,4) for any leftover worker.
-    # A robust agent would check inventory capacity.
-    tasks.append({"type": "DROP", "pos": [4, 4], "args": []})
-
-    # Assign tasks to the closest unassigned workers
+    # Assign all tasks by priority.
     for task in tasks:
-        # For Priority 6, we might want all remaining workers to do it, so we don't break.
-        if not unassigned_workers:
+        if not unassigned:
             break
-            
-        closest_id = get_closest_worker(task["pos"], unassigned_workers)
-        worker_pos = unassigned_workers[closest_id]
-        
-        if worker_pos == task["pos"]:
-            assign_worker(closest_id, [task["type"]] + task["args"])
+        assign_task(task)
+
+    # Idle workers: hover near the shed where pickups/drops happen.
+    for wid in list(unassigned.keys()):
+        wpos = unassigned[wid]
+        shed_pos = closest_shed_tile(wpos)
+        if list(wpos) != list(shed_pos):
+            m = move_towards(wpos, shed_pos)
+            assign(wid, [m] if m else ["PASS"])
         else:
-            move = move_towards(worker_pos, task["pos"])
-            if move:
-                assign_worker(closest_id, [move])
-            else:
-                assign_worker(closest_id, ["PASS"])
-                
-    # If any workers are still unassigned after all tasks, make them move to shed (4,4) or PASS
-    for worker_id in list(unassigned_workers.keys()):
-        worker_pos = unassigned_workers[worker_id]
-        if worker_pos != [4, 4]:
-            move = move_towards(worker_pos, [4, 4])
-            assign_worker(worker_id, [move] if move else ["PASS"])
-        else:
-            assign_worker(worker_id, ["DROP"])
+            assign(wid, ["PASS"])
 
     return {
-        "farmer": worker_actions["farmer"],
-        "hands": worker_actions["hands"],
-        "market": market
+        "farmer": actions["farmer"] or ["PASS"],
+        "hands": [a or ["PASS"] for a in actions["hands"]],
+        "market": market,
     }
 
+
 if __name__ == "__main__":
-    # Realistic initial observation matching the actual game state
-    test_obs = {
-        "step": 1,
-        "day": 1,
-        "hour": 6,
-        "player": 0,
-        "farms": [
-            {
-                "money": 3000,
-                "farmer": [4, 4],
-                "hands": [],
-                "unlocked_quadrants": [0],
-                "tiles": [["LOCKED" if (x >= 5 or y >= 5) else None for x in range(10)] for y in range(10)]
-            },
-            {
-                "money": 3000,
-                "farmer": [4, 4],
-                "hands": [],
-                "unlocked_quadrants": [0],
-                "tiles": [["LOCKED" if (x >= 5 or y >= 5) else None for x in range(10)] for y in range(10)]
-            }
-        ],
-        "market": {
-            "inventory": {}
-        },
-        "town": {
-            "unlocked_shops": []
-        },
-        "private": {
-            "seeds": {"WHEAT": 5},
-            "shed": {}
+    from copy import deepcopy
+
+    def fresh_obs(day=0):
+        """Realistic observation matching the environment schema."""
+        tiles = [["LOCKED" if (x >= 5 or y >= 5) else None for x in range(10)] for y in range(10)]
+        farm = {
+            "money": 3000.0,
+            "farmer": [4, 4],
+            "hands": [],
+            "unlocked_quadrants": ["NW"],
+            "hires_today": 0,
+            "tiles": tiles,
         }
-    }
-    
-    print("Testing agent with initial state...")
-    action = agent(test_obs)
+        return {
+            "step": 0,
+            "day": day,
+            "hour": 0,
+            "player": 0,
+            "farms": [farm, deepcopy(farm)],
+            "market": {"inventory": {}, "prices": {p: MARKET_PARAMS[p]["base"] for p in PRODUCTS}},
+            "town": {"unlocked_shops": []},
+            "private": {
+                "shed": {p: 0 for p in PRODUCTS + list(ANIMALS)},
+                "seeds": {c: 0 for c in CROPS},
+                "inventories": [{}],
+            },
+        }
+
+    print("--- Day 0: initial state ---")
+    action = agent(fresh_obs(day=0))
     print("Agent Action:", action)
-    
-    print("\nTesting agent on mature plant...")
-    # Modify the dummy observation to simulate standing on a mature wheat plant
-    test_obs["farms"][0]["tiles"][4][4] = {
-        "kind": "PLANT",
-        "planted_day": -1, # day 1 - (-1) = age 2
-        "watered_today": False
+
+    print("\n--- Day 2: wheat plant, goose needing feed, weed ---")
+    obs = fresh_obs(day=2)
+    obs["step"] = 2 * 24
+    # Wheat planted day 0, kept watered -> yield 3; at age 2 (bonus window)
+    obs["farms"][0]["tiles"][4][3] = {
+        "kind": "PLANT", "crop": "WHEAT", "planted_day": 0,
+        "watered_today": False, "consecutive_unwatered": 0,
+        "yield_units": 3, "max_lifespan_step": (0 + 4 + 1) * 24,
+        "fertilized_until_day": -1,
     }
-    action2 = agent(test_obs)
-    print("Agent Action:", action2)
+    # A coop holding a goose that is one day away from escaping
+    obs["farms"][0]["tiles"][3][4] = {
+        "kind": "COOP", "animal": "GOOSE", "placed_day": 1,
+        "yield_units": 0, "consecutive_unfed": 1, "fed_today": False,
+        "cared_today": False, "fertilizer_available": False, "pending_care_bonus": 0,
+    }
+    # A weed blocking a tile
+    obs["farms"][0]["tiles"][3][3] = {"kind": "WEED"}
+    obs["private"]["seeds"] = {"WHEAT": 2, "CARROT": 2}
+    obs["private"]["shed"]["WHEAT"] = 3
+    action = agent(obs)
+    print("Agent Action:", action)
+
+    print("\n--- Day 10: with two hands, goose on farm ---")
+    obs = fresh_obs(day=10)
+    obs["step"] = 10 * 24
+    obs["farms"][0]["hands"] = [[5, 4], [4, 5]]
+    # Mature wheat ready for harvest (age 4+, full watering bonus)
+    obs["farms"][0]["tiles"][4][3] = {
+        "kind": "PLANT", "crop": "WHEAT", "planted_day": 6,
+        "watered_today": False, "consecutive_unwatered": 0,
+        "yield_units": 4, "max_lifespan_step": (6 + 4 + 1) * 24,
+        "fertilized_until_day": -1,
+    }
+    # Goose producing an egg
+    obs["farms"][0]["tiles"][3][4] = {
+        "kind": "COOP", "animal": "GOOSE", "placed_day": 6,
+        "yield_units": 1, "consecutive_unfed": 0, "fed_today": False,
+        "cared_today": False, "fertilizer_available": True, "pending_care_bonus": 0,
+    }
+    obs["private"]["shed"]["WHEAT"] = 8
+    obs["private"]["shed"]["FERTILIZER"] = 2
+    obs["private"]["inventories"] = [{}, {"WHEAT": 2}, {}]
+    action = agent(obs)
+    print("Agent Action:", action)
