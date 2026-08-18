@@ -2,6 +2,8 @@
 Real-time game logger - Records every agent decision as the game runs
 """
 import json
+import os
+import glob
 from kaggle_environments import make
 
 # Global action log
@@ -25,6 +27,7 @@ def logged_agent(obs, agent_func):
         'money_before': obs['farms'][player]['money'],
         'farmer_action': action.get('farmer', ['PASS']),
         'market_orders': action.get('market', []),
+        'tiles': obs['farms'][player]['tiles'],
     }
     
     action_log.append(log_entry)
@@ -53,7 +56,22 @@ def record_game_with_logging(seed=42):
     obs = env.state[0]['observation']
     
     # Save log to JSON
-    with open("game_log.json", "w", encoding="utf-8") as f:
+    os.makedirs("game_logs", exist_ok=True)
+    existing_logs = glob.glob("game_logs/game_log*.json")
+    max_num = 0
+    for log_file in existing_logs:
+        try:
+            basename = os.path.basename(log_file)
+            num_str = basename.replace("game_log", "").replace(".json", "")
+            if num_str.isdigit():
+                max_num = max(max_num, int(num_str))
+        except Exception:
+            pass
+    
+    next_num = max_num + 1
+    log_filename = f"game_logs/game_log{next_num}.json"
+    
+    with open(log_filename, "w", encoding="utf-8") as f:
         json.dump({
             'action_log': action_log,
             'final_state': {
@@ -63,7 +81,7 @@ def record_game_with_logging(seed=42):
             }
         }, f, indent=2, default=str)
     
-    print(f"[OK] Recorded {len(action_log)} actions to game_log.json")
+    print(f"[OK] Recorded {len(action_log)} actions to {log_filename}")
     return env, action_log, obs
 
 if __name__ == "__main__":

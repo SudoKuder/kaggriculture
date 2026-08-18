@@ -164,14 +164,90 @@ def agent(obs):
     
     state = GameState(obs)
     
-    # Market logic
+    # Market & Phase Logic
     market = []
-    wheat_seeds = state.private.get("seeds", {}).get("WHEAT", 0)
-    if wheat_seeds == 0 and state.me["money"] >= 10:
-        market.append(["BUY_SEED", "WHEAT", 1])
-    wheat_in_shed = state.private.get("shed", {}).get("WHEAT", 0)
-    if wheat_in_shed > 0:
-        market.append(["SELL", "WHEAT", wheat_in_shed])
+    day = state.day
+    money = state.me["money"]
+    shed = state.private.get("shed", {})
+    seeds = state.private.get("seeds", {})
+    empty_tiles_count = len(state.get_empty_tiles())
+    unlocked_quads = len(state.me["unlocked_quadrants"])
+    
+    # Current seeds count (excluding fertilizer)
+    current_seeds = sum(v for k, v in seeds.items() if k != "FERTILIZER")
+    seeds_to_buy = max(0, empty_tiles_count + 5 - current_seeds)
+    
+    # Sell harvested products
+    for item, qty in shed.items():
+        if item in ["GOOSE", "COW", "SHEEP", "FERTILIZER"]:
+            if day >= 26:  # Liquidate in end game
+                market.append(["SELL", item, qty])
+        else:
+            if qty > 0:
+                market.append(["SELL", item, qty])
+
+    if day <= 8:
+        # Early Game: Fast Cash
+        land_cost = 1000 * (2 ** (unlocked_quads - 1)) if unlocked_quads < 4 else float('inf')
+        # Target seed cost ~15. Buffer = 25 * 15 = 375
+        if empty_tiles_count <= 2 and money >= land_cost + 375:
+            market.append(["BUY_LAND"])
+            money -= land_cost
+            
+        wheat_to_buy = seeds_to_buy // 2
+        carrot_to_buy = seeds_to_buy - wheat_to_buy
+        if wheat_to_buy > 0 and money >= wheat_to_buy * 10:
+            market.append(["BUY_SEED", "WHEAT", wheat_to_buy])
+            money -= wheat_to_buy * 10
+        if carrot_to_buy > 0 and money >= carrot_to_buy * 20:
+            market.append(["BUY_SEED", "CARROT", carrot_to_buy])
+            money -= carrot_to_buy * 20
+
+    elif day <= 20:
+        # Mid Game: High Yield & Animals
+        land_cost = 1000 * (2 ** (unlocked_quads - 1)) if unlocked_quads < 4 else float('inf')
+        if empty_tiles_count <= 2 and money >= land_cost + 500: # Slightly larger buffer for Mid Game
+            market.append(["BUY_LAND"])
+            money -= land_cost
+
+        # Animal capacity cap (40% of land)
+        total_land = unlocked_quads * 25
+        animal_cap = int(0.4 * total_land)
+        
+        existing_animals = sum(
+            1 for row in state.tiles for tile in row 
+            if isinstance(tile, dict) and tile.get("kind") in ["COOP", "PASTURE"]
+        )
+        animals_in_shed = sum(v for k,v in shed.items() if k in ["GOOSE", "COW", "SHEEP"])
+        total_animals = existing_animals + animals_in_shed
+        
+        if total_animals < animal_cap and money >= 500:
+            market.append(["BUY_ANIMAL", "GOOSE", 1]) # Max 1 animal per day
+            money -= 500
+            
+        tomato_to_buy = seeds_to_buy // 2
+        strawberry_to_buy = seeds_to_buy - tomato_to_buy
+        if tomato_to_buy > 0 and money >= tomato_to_buy * 20:
+            market.append(["BUY_SEED", "TOMATO", tomato_to_buy])
+            money -= tomato_to_buy * 20
+        if strawberry_to_buy > 0 and money >= strawberry_to_buy * 30:
+            market.append(["BUY_SEED", "STRAWBERRY", strawberry_to_buy])
+            money -= strawberry_to_buy * 30
+
+    elif day <= 25:
+        # Late Game: Quick Turnarounds
+        melon_to_buy = seeds_to_buy // 2
+        wheat_to_buy = seeds_to_buy - melon_to_buy
+        if melon_to_buy > 0 and money >= melon_to_buy * 50:
+            market.append(["BUY_SEED", "MELON", melon_to_buy])
+            money -= melon_to_buy * 50
+        if wheat_to_buy > 0 and money >= wheat_to_buy * 10:
+            market.append(["BUY_SEED", "WHEAT", wheat_to_buy])
+            money -= wheat_to_buy * 10
+
+    else:
+        # End Game: Liquidation
+        pass # Only selling, handled above
 
     # Gather available workers
     unassigned_workers = {"farmer": state.me["farmer"]}
@@ -218,14 +294,37 @@ def agent(obs):
     enqueue_tasks(state.get_care_and_fertilize_tiles())
     
     # Priority 5: Planting/Building
-    seeds_to_plant = wheat_seeds
-    for x, y in state.get_empty_tiles():
-        if seeds_to_plant <= 0:
-            break
-        if (x, y) not in queued_positions:
-            tasks.append({"type": "PLANT", "pos": [x, y], "args": ["WHEAT"]})
-            queued_positions.add((x, y))
-            seeds_to_plant -= 1
+    if day <= 25 and unassigned_workers:
+        available_seeds = []
+        for seed_type, qty in seeds.items():
+            if seed_type != "FERTILIZER":
+                available_seeds.extend([seed_type] * qty)
+                
+        empty_tiles = [
+            (x, y) for x, y in state.get_empty_tiles() 
+            if (x, y) not in queued_positions
+        ]
+
+        for worker_id in list(unassigned_workers.keys()):
+            if not available_seeds or not empty_tiles:
+                break
+                
+            worker_pos = unassigned_workers[worker_id]
+            # Find the unassigned empty tile nearest to this specific worker
+            closest_tile = min(empty_tiles, key=lambda pos: manhattan_distance(worker_pos, pos))
+            
+            seed_to_plant = available_seeds.pop(0)
+            empty_tiles.remove(closest_tile)
+            queued_positions.add(closest_tile)
+            
+            if list(closest_tile) == worker_pos:
+                assign_worker(worker_id, ["PLANT", seed_to_plant])
+            else:
+                move = move_towards(worker_pos, closest_tile)
+                if move:
+                    assign_worker(worker_id, [move])
+                else:
+                    assign_worker(worker_id, ["PASS"])
 
     # Priority 6: Logistics (Shed)
     # If unassigned workers exist, send them to the shed to wait/drop off.

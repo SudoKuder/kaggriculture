@@ -162,6 +162,7 @@
   .game-tile.locked { background: #212921; }
   .game-tile.farmer { outline: 2px solid #ffffff99; }
   .game-tile.watered { box-shadow: inset 0 0 0 2px #6db7ff66; }
+  .game-tile.thirsty { box-shadow: inset 0 0 0 2px #e0645e66; }
 
   table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
   thead th {
@@ -241,7 +242,7 @@
     </div>
   </div>
   <div class="day-marker" style="margin-top:8px;">
-    Reconstructed from logged actions (plant/water/harvest/build/land). This is an approximation when full tile state is not logged.
+    Reconstructed from logged actions, or directly from board state if available in logs. Showing weeds, unwatered plants (red border), and actual crop types.
   </div>
 </div>
 
@@ -444,7 +445,13 @@ function buildBoardSnapshots() {
     const p = entry.player;
     farmers[p] = [...entry.farmer_pos];
     money[p] = entry.money_before;
-    applyLogActionToBoard(entry, boards[p]);
+    
+    if (entry.tiles) {
+      boards[p] = copyBoard(entry.tiles);
+    } else {
+      applyLogActionToBoard(entry, boards[p]);
+    }
+    
     boardSnapshots[idx] = {
       boards: [copyBoard(boards[0]), copyBoard(boards[1])],
       farmers: [[...farmers[0]], [...farmers[1]]],
@@ -457,8 +464,9 @@ function tileEmoji(tile) {
   if (tile === 'LOCKED') return '🔒';
   if (tile == null) return '·';
   if (tile.kind === 'PLANT') {
+    const cropType = tile.type || tile.crop;
     const map = { WHEAT: '🌾', CARROT: '🥕', TOMATO: '🍅', STRAWBERRY: '🍓', MELON: '🍈' };
-    return map[tile.crop] || '🌱';
+    return map[cropType] || '🌱';
   }
   if (tile.kind === 'COOP') return '🦆';
   if (tile.kind === 'PASTURE') return '🐄';
@@ -474,8 +482,21 @@ function renderBoardHtml(board, farmerPos) {
       const tile = board[y][x];
       const classes = ['game-tile'];
       if (tile === 'LOCKED') classes.push('locked');
-      if (tile && tile.kind === 'PLANT' && tile.watered) classes.push('watered');
+      
+      let watered = false;
+      let thirsty = false;
+      
+      if (tile && tile.kind === 'PLANT') {
+        if (tile.watered !== undefined) watered = tile.watered;
+        else if (tile.watered_today !== undefined) watered = tile.watered_today;
+        
+        if (!watered) thirsty = true;
+      }
+      
+      if (watered) classes.push('watered');
+      if (thirsty) classes.push('thirsty');
       if (x === fx && y === fy) classes.push('farmer');
+      
       out.push(`<div class="${classes.join(' ')}">${tileEmoji(tile)}</div>`);
     }
   }
