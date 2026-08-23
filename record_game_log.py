@@ -39,7 +39,7 @@ def record_game_with_logging(seed=42):
     global action_log
     action_log = []
     
-    from agent import agent as player_agent
+    from main import agent as player_agent
     
     # Create wrappers
     def agent_0(obs):

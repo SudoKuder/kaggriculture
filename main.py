@@ -1,4 +1,5 @@
 # submission.py
+# pyrefly: ignore [missing-import]
 from kaggle_environments.envs.kaggriculture.kaggriculture import CROPS, PRODUCTS, ANIMALS, MARKET_PARAMS
 
 # Global counter to track steps (for logging)
@@ -78,6 +79,9 @@ class GameState:
     def harvestable_plants(self):
         out = []
         for x, y, t in self.plants():
+            if self.day >= 29 and t.get("yield_units", 0) > 0:
+                out.append((x, y))
+                continue
             crop = t.get("crop", "WHEAT")
             cd = CROPS[crop]
             a = self.age(t)
@@ -206,16 +210,24 @@ def build_market(state):
     orders = []
 
     # ---- SELL (economy products first so we have money for buys this turn) ----
+    worker_invs = state.private.get("inventories", [])
+    hour = state.obs.get("hour", 0)
+    
+    def total_in_inv(product):
+        if day >= 29 and hour >= 23:
+            return sum(inv.get(product, 0) for inv in worker_invs if isinstance(inv, dict))
+        return 0
+
     sell_candidates = [
-        ("FERTILIZER", max(0, shed.get("FERTILIZER", 0) - fert_reserve)),
-        ("CARROT", shed.get("CARROT", 0)),
-        ("TOMATO", shed.get("TOMATO", 0)),
-        ("EGG", shed.get("EGG", 0)),
-        ("WHEAT", sellable_wheat),
-        ("STRAWBERRY", shed.get("STRAWBERRY", 0)),
-        ("MELON", shed.get("MELON", 0)),
-        ("MILK", shed.get("MILK", 0)),
-        ("WOOL", shed.get("WOOL", 0)),
+        ("FERTILIZER", max(0, shed.get("FERTILIZER", 0) - fert_reserve) + total_in_inv("FERTILIZER")),
+        ("CARROT", shed.get("CARROT", 0) + total_in_inv("CARROT")),
+        ("TOMATO", shed.get("TOMATO", 0) + total_in_inv("TOMATO")),
+        ("EGG", shed.get("EGG", 0) + total_in_inv("EGG")),
+        ("WHEAT", sellable_wheat + total_in_inv("WHEAT")),
+        ("STRAWBERRY", shed.get("STRAWBERRY", 0) + total_in_inv("STRAWBERRY")),
+        ("MELON", shed.get("MELON", 0) + total_in_inv("MELON")),
+        ("MILK", shed.get("MILK", 0) + total_in_inv("MILK")),
+        ("WOOL", shed.get("WOOL", 0) + total_in_inv("WOOL")),
     ]
     for product, qty in sell_candidates:
         if qty <= 0:
@@ -230,7 +242,6 @@ def build_market(state):
     # (the day's first turn). The market processes orders every turn, so without
     # this gate we'd buy 24x/day and drain cash instantly. BUY_PRODUCT wheat is
     # exempt (handled above) because feed wheat must be replenished promptly.
-    hour = state.obs.get("hour", 0)
 
     # ---- BUY_PRODUCT wheat for animal feed (animals must eat) ----
     # NOT gated to hour 0: shedding wheat below the reserve must be replenished
@@ -246,14 +257,26 @@ def build_market(state):
             orders.append(["BUY_PRODUCT", "WHEAT", need])
             money -= cost
 
-    # ---- HIRE farm hands (day-hire; very cheap, reset each day) ----
-    # Cost = fib(n) for the n-th hire today (1,1,2,3,5,...). Each hand adds up
-    # to 24 actions/day, so 3-4 hands are easily profitable once the farm grows.
+    # ---- HIRE farm hands (Dynamic calculation) ----
     if hour == 0 and 1 <= day <= 24 and money > 50:
+        tasks_today = 0
+        tasks_today += len(state.plants())
+        tasks_today += state.animals_on_farm() * 3
+        tasks_today += len(state.harvestable_plants())
+        tasks_today += len(state.harvestable_animals())
+        tasks_today += empty_n
+        tasks_today += weeds_n * 2
+        tasks_today += len(state.fertilize_candidates())
+        
+        # Estimate 2 turns per task (1 for action, 1 for movement)
+        turns_needed = tasks_today * 2
+        workers_needed = (turns_needed + 23) // 24
+        
         have_hands = len(state.me["hands"])
-        target = 2 if day < 3 else 3 if day < 12 else 4
-        need = max(0, target - have_hands)
-        for i in range(need):
+        target = workers_needed
+        need_hires = max(0, (target - 1) - have_hands)
+        
+        for i in range(need_hires):
             hire_idx = have_hands + i
             cost = [1, 1, 2, 3, 5][hire_idx] if hire_idx < 5 else 8
             if money >= cost:
@@ -272,45 +295,41 @@ def build_market(state):
         orders.append(["BUY_LAND"])
         money -= land_cost
 
-    # ---- BUY_SEED (only plant what we have room for) ----
-    # Self-limiting: buy when seeds are low relative to empty tiles. Not strictly
-    # hour-gated because 3 workers planting 1 seed/turn burn up to 72 seeds/day;
-    # hour-0-only restocking starves them and idles tiles. `need_seeds` bounds
-    # the order to what could actually be planted.
-    # Weeds get dug (P3) and become plantable the same day, so count them
-    # toward the seed requirement too — otherwise we'd run out of seeds right
-    # after clearing.
+    # ---- BUY_SEED (Dynamic ROI) ----
     need_seeds = max(0, empty_n + weeds_n - seed_count)
     hands_n = len(state.me["hands"])
-    # Restock when we have less than 1 hour of work per worker (workers each
-    # plant 1 seed/turn), plus a small buffer. This keeps tiles planted all day
-    # without the degenerate 24x/day buying that hoards unusable seeds.
-    seed_burn = hands_n + 1  # farmer + hired hands
+    seed_burn = hands_n + 1
     seed_threshold = max(2 * seed_burn, 4)
     if seed_count < seed_threshold and need_seeds > 0 and day <= 26:
-        if day <= 7:  # Early: wheat + carrot
-            wn = min(need_seeds, 20)
-            if money >= wn * 10:
-                orders.append(["BUY_SEED", "WHEAT", wn]); money -= wn * 10
-            cn = min(max(0, need_seeds - wn), 10)
-            if cn > 0 and money >= cn * 20:
-                orders.append(["BUY_SEED", "CARROT", cn]); money -= cn * 20
-        elif day <= 17:  # Mid: wheat + tomato (tomato needs 8 days to first yield)
-            wn = min(need_seeds, 20)
-            if money >= wn * 10:
-                orders.append(["BUY_SEED", "WHEAT", wn]); money -= wn * 10
-            tn = min(max(0, need_seeds - wn), 10)
-            if tn > 0 and money >= tn * 50:
-                orders.append(["BUY_SEED", "TOMATO", tn]); money -= tn * 50
-        elif day <= 19 and hour == 0:  # Melon window (day 18-19): melon needs 10 days
-            # Hour-gated: otherwise the env buys 1 melon EVERY hour of both
-            # days (24x/day at $80 each) — a huge cash drain.
-            if need_seeds > 0 and money >= 80:
-                orders.append(["BUY_SEED", "MELON", 1]); money -= 80
-        elif day <= 26:  # Late: fast crops only
-            wn = min(need_seeds, 20)
-            if money >= wn * 10:
-                orders.append(["BUY_SEED", "WHEAT", wn]); money -= wn * 10
+        best_crop = None
+        best_profit = -float('inf')
+        
+        for crop in CROPS:
+            cd = CROPS[crop]
+            if cd["ongoing"]:
+                time_to_max = cd["first_yield_day"] + cd["interval"] * (cd["max_yield"] - 1)
+            else:
+                time_to_max = cd["max_yield_day"]
+                
+            # Check if it has time to reach max yield before day 29, with 1 day buffer for planting
+            if day + time_to_max + 1 <= 29:
+                market_price = max(1, int(state.market.get("prices", {}).get(crop, 25)))
+                profit_per_day = ((market_price * cd["max_yield"]) - cd["seed"]) / time_to_max
+                
+                if profit_per_day > best_profit:
+                    best_profit = profit_per_day
+                    best_crop = crop
+                    
+        if best_crop:
+            seed_price = CROPS[best_crop]["seed"]
+            buy_qty = min(need_seeds, int(money // seed_price))
+            if buy_qty > 0:
+                # Keep a small buffer early game for hiring/wheat
+                max_spend = money - 50 if day < 10 else money
+                buy_qty = min(buy_qty, int(max_spend // seed_price))
+                if buy_qty > 0:
+                    orders.append(["BUY_SEED", best_crop, buy_qty])
+                    money -= buy_qty * seed_price
 
     # ---- BUY_ANIMAL (max 6 total; 1/day while in the mid-game window) ----
     # Geese produce daily once placed, and CARE doubles output. A goose bought
@@ -356,82 +375,81 @@ def agent(obs):
             actions["hands"][idx] = action
         unassigned.pop(wid, None)
 
-    def assign_task(task):
-        """Assign one task (type, pos, requires, args) to the closest free worker.
-        If the worker is missing a required inventory item, route them to the shed
-        to PICKUP first; their inventory persists, so they complete the task on a
-        later turn once they have the item."""
-        if not unassigned:
-            return
-        typ, pos, requires, args = task
-        if requires:
-            # Prefer a worker already carrying the required item to avoid a
-            # shed round-trip.
-            holders = [wid for wid in unassigned if inventory_of(wid).get(requires, 0) > 0]
-            wid = (min(holders, key=lambda w: manhattan_distance(unassigned[w], pos))
-                   if holders else get_closest_worker(pos, unassigned))
-        else:
-            wid = get_closest_worker(pos, unassigned)
-        if wid is None:
-            return
-        wpos = unassigned[wid]
-        inv = inventory_of(wid)
-        has_req = requires is None or inv.get(requires, 0) > 0
-
-        if list(wpos) == list(pos) and has_req:
-            assign(wid, [typ] + (args or []))
-        elif requires and not has_req:
-            # Worker needs the required item from the shed before acting.
-            shed_pos = closest_shed_tile(wpos)
-            if list(wpos) == list(shed_pos):
-                assign(wid, ["PICKUP", requires, 5])
+    def assign_tier(tier_tasks):
+        while tier_tasks and unassigned:
+            best_pair = None
+            best_cost = float('inf')
+            
+            for task_idx, task in enumerate(tier_tasks):
+                typ, pos, requires, args = task
+                
+                if requires:
+                    holders = [w for w in unassigned if inventory_of(w).get(requires, 0) > 0]
+                    candidates = holders if holders else list(unassigned.keys())
+                else:
+                    candidates = list(unassigned.keys())
+                    
+                for wid in candidates:
+                    wpos = unassigned[wid]
+                    
+                    has_req = requires is None or inventory_of(wid).get(requires, 0) > 0
+                    if requires and not has_req:
+                        shed_pos = closest_shed_tile(wpos)
+                        cost = manhattan_distance(wpos, shed_pos) + manhattan_distance(shed_pos, pos)
+                    else:
+                        cost = manhattan_distance(wpos, pos)
+                        
+                    if cost < best_cost:
+                        best_cost = cost
+                        best_pair = (wid, task_idx)
+                        
+            if best_pair:
+                wid, task_idx = best_pair
+                task = tier_tasks.pop(task_idx)
+                
+                typ, pos, requires, args = task
+                wpos = unassigned[wid]
+                has_req = requires is None or inventory_of(wid).get(requires, 0) > 0
+                
+                if list(wpos) == list(pos) and has_req:
+                    assign(wid, [typ] + (args or []))
+                elif requires and not has_req:
+                    shed_pos = closest_shed_tile(wpos)
+                    if list(wpos) == list(shed_pos):
+                        assign(wid, ["PICKUP", requires, 5])
+                    else:
+                        m = move_towards(wpos, shed_pos)
+                        assign(wid, [m] if m else ["PASS"])
+                else:
+                    m = move_towards(wpos, pos)
+                    assign(wid, [m] if m else ["PASS"])
             else:
-                m = move_towards(wpos, shed_pos)
-                assign(wid, [m] if m else ["PASS"])
-        else:
-            m = move_towards(wpos, pos)
-            assign(wid, [m] if m else ["PASS"])
+                break
 
-    # Build the task queue by priority.
-    # Each entry: (type, [x, y], requires_inventory_item, args)
-    tasks = []
+    # Build the task queues by priority tiers.
+    p1_tasks = []
+    p2_tasks = []
+    p3_tasks = []
+    p4_tasks = []
+    p5_tasks = []
 
-    # Track tiles already queued so P1 and P4 don't both schedule the same
-    # water/feed (actions only become visible in the next observation).
     water_queued = set()
     feed_queued = set()
 
-    # P1: Critical survival — plants one missed day from becoming weeds,
-    #     animals one missed day from escaping.
     for x, y, t in state.plants():
         if not t.get("watered_today", False) and t.get("consecutive_unwatered", 0) >= 1:
-            tasks.append(("WATER", [x, y], None, []))
+            p1_tasks.append(("WATER", [x, y], None, []))
             water_queued.add((x, y))
     for x, y, t in state.animals():
         if not t.get("fed_today", False) and t.get("consecutive_unfed", 0) >= 1:
-            tasks.append(("FEED", [x, y], "WHEAT", []))
+            p1_tasks.append(("FEED", [x, y], "WHEAT", []))
             feed_queued.add((x, y))
 
-    # P2: Harvest ripe plants and animals with accumulated produce.
     for x, y in state.harvestable_plants():
-        tasks.append(("HARVEST", [x, y], None, []))
+        p2_tasks.append(("HARVEST", [x, y], None, []))
     for x, y in state.harvestable_animals():
-        tasks.append(("HARVEST", [x, y], None, []))
+        p2_tasks.append(("HARVEST", [x, y], None, []))
 
-    # P3: Clear weeds so the land can be planted again.
-    for x, y in state.weeds():
-        tasks.append(("DIG", [x, y], None, []))
-
-    # P4: Daily upkeep that adds yield value.
-    #   - One-time crops: water only inside their bonus window and only if
-    #     watering still adds yield (yield_units below the cap). Plants past
-    #     the window are at max yield already — watering wastes a worker turn
-    #     (their survival needs are covered by P1).
-    #   - Ongoing crops (tomato/strawberry): watering only boosts yield while
-    #     fertilized (fertilized+watered production days yield 2 instead of 1).
-    #     Unfertilized ongoing watering is survival-only → P1.
-    #   - Animals: feed the remainder, CARE every animal (banks +1 to the next
-    #     production), and collect the free fertilizer.
     for x, y, t in state.plants():
         if (x, y) in water_queued or t.get("watered_today", False):
             continue
@@ -439,83 +457,136 @@ def agent(obs):
         cd = CROPS[crop]
         if cd["ongoing"]:
             if t.get("fertilized_until_day", -1) >= state.day:
-                tasks.append(("WATER", [x, y], None, []))
+                p3_tasks.append(("WATER", [x, y], None, []))
         else:
             a = state.age(t)
             window_start = (cd["max_yield_day"] + 1) // 2
             if window_start <= a <= cd["max_yield_day"]:
                 if t.get("yield_units", 0) < cd["max_yield"]:
-                    tasks.append(("WATER", [x, y], None, []))
+                    p3_tasks.append(("WATER", [x, y], None, []))
     for x, y, t in state.animals():
         if not t.get("fed_today", False) and (x, y) not in feed_queued:
-            tasks.append(("FEED", [x, y], "WHEAT", []))
+            p3_tasks.append(("FEED", [x, y], "WHEAT", []))
     for x, y, t in state.animals():
         if not t.get("cared_today", False):
-            tasks.append(("CARE", [x, y], None, []))
+            p3_tasks.append(("CARE", [x, y], None, []))
         if t.get("fertilizer_available", False):
-            tasks.append(("COLLECT_FERTILIZER", [x, y], None, []))
+            p3_tasks.append(("COLLECT_FERTILIZER", [x, y], None, []))
 
-    # P5: Crop FERTILIZE (if we have some).
     if state.shed.get("FERTILIZER", 0) > 0:
         for x, y in state.fertilize_candidates():
-            tasks.append(("FERTILIZE", [x, y], "FERTILIZER", []))
+            p4_tasks.append(("FERTILIZE", [x, y], "FERTILIZER", []))
 
-    # P6: Animal logistics — build coops and place animals waiting in the shed.
     waiting_animals = state.animals_in_shed()
     if waiting_animals > 0:
         free_coops = [(x, y, t) for x, y, t in state.empty_structures() if t.get("kind") == "COOP"]
         if not free_coops:
             empty = state.empty_tiles()
             if empty:
-                # Build one coop per waiting goose (up to 2/turn) so a backlog
-                # doesn't keep animals in the shed for days.
                 build_targets = sorted(empty, key=lambda p: manhattan_distance(p, (HALF - 1, HALF - 1)))
                 for _ in range(min(waiting_animals, 2, len(build_targets))):
                     p = build_targets.pop(0)
-                    tasks.append(("BUILD_COOP", list(p), None, []))
+                    p5_tasks.append(("BUILD_COOP", list(p), None, []))
         else:
-            # Only emit as many PLACE tasks as there are animals waiting.
             for (x, y, t) in free_coops[:waiting_animals]:
-                tasks.append(("PLACE", [x, y], "GOOSE", ["GOOSE"]))
+                p5_tasks.append(("PLACE", [x, y], "GOOSE", ["GOOSE"]))
 
-    # P7: Plant seeds (only crops that still have time to mature by day 29).
-    # Day 27 wheat/carrot still produce a harvest by day 29.
-    if state.day <= 27:
-        plantable = [(c, n) for c, n in state.seeds.items() if n > 0
-                     and SEASON - state.day >= CROPS[c]["first_yield_day"]]
-        seed_pool = []
-        for crop, n in plantable:
-            seed_pool.extend([crop] * n)
-
-        empty = state.empty_tiles()
-        # Don't plant on tiles reserved for higher-priority building tasks.
-        for (typ, pos, _, _) in tasks:
-            if typ in ("BUILD_COOP", "BUILD_PASTURE") and tuple(pos) in empty:
-                empty.remove(tuple(pos))
-        for pos in empty:
-            if not seed_pool:
-                break
-            crop = seed_pool.pop(0)
-            tasks.append(("PLANT", list(pos), None, [crop]))
+    # (P7 planting removed from here; handled dynamically below)
 
     # P8: Inventory management — large inventories need DROPping at the shed
     #     so harvested goods can be sold from the shed.
     for wid in list(unassigned.keys()):
         inv = inventory_of(wid)
         total = sum(inv.values()) if inv else 0
-        if total >= 15:
-            shed_pos = closest_shed_tile(unassigned[wid])
-            if list(unassigned[wid]) == list(shed_pos):
+        wpos = unassigned[wid]
+        dist = manhattan_distance(wpos, closest_shed_tile(wpos))
+        panic_drop = state.day >= 29 and state.obs.get("hour", 0) >= 23 - dist
+        if total >= 15 or (total > 0 and panic_drop):
+            shed_pos = closest_shed_tile(wpos)
+            if list(wpos) == list(shed_pos):
                 assign(wid, ["DROP"])
             else:
-                m = move_towards(unassigned[wid], shed_pos)
+                m = move_towards(wpos, shed_pos)
                 assign(wid, [m] if m else ["PASS"])
 
-    # Assign all tasks by priority.
-    for task in tasks:
-        if not unassigned:
+    for tier in [p1_tasks, p2_tasks, p3_tasks, p4_tasks, p5_tasks]:
+        assign_tier(tier)
+
+    # NEW: Combined P3 (Weeds) and P7 (Planting) distance-based heuristic.
+    # We iterate workers first, assigning them to the nearest available empty tile or weed.
+    # Weeds get a cost penalty of +1 (1 extra turn to DIG).
+    seed_pool = []
+    if state.day <= 27:
+        plantable = []
+        for c, n in state.seeds.items():
+            if n > 0:
+                cd = CROPS[c]
+                if cd["ongoing"]:
+                    time_to_max = cd["first_yield_day"] + cd["interval"] * (cd["max_yield"] - 1)
+                else:
+                    time_to_max = cd["max_yield_day"]
+                if (29 - state.day) >= time_to_max:
+                    plantable.append((c, n))
+        for crop, n in plantable:
+            seed_pool.extend([crop] * n)
+
+    empty_set = set(state.empty_tiles())
+    all_building_tiles = set(tuple(pos) for typ, pos, _, _ in p5_tasks if typ in ("BUILD_COOP", "BUILD_PASTURE"))
+    for pos in list(empty_set):
+        if pos in all_building_tiles:
+            empty_set.remove(pos)
+            
+    available_empty = list(empty_set)
+    available_weeds = state.weeds()
+
+    while (available_empty or available_weeds) and unassigned:
+        best_pair = None
+        best_cost = float('inf')
+        best_type = None
+        best_target = None
+        
+        for wid in list(unassigned.keys()):
+            wpos = unassigned[wid]
+            
+            for pos in available_empty:
+                cost = manhattan_distance(wpos, pos)
+                if cost < best_cost:
+                    best_cost = cost
+                    best_pair = wid
+                    best_target = pos
+                    best_type = "empty"
+                    
+            for pos in available_weeds:
+                cost = manhattan_distance(wpos, pos) + 1
+                if cost < best_cost:
+                    best_cost = cost
+                    best_pair = wid
+                    best_target = pos
+                    best_type = "weed"
+                    
+        if best_pair:
+            wid = best_pair
+            wpos = unassigned[wid]
+            if best_type == "empty":
+                available_empty.remove(best_target)
+                if list(wpos) == list(best_target):
+                    if seed_pool:
+                        crop = seed_pool.pop(0)
+                        assign(wid, ["PLANT", crop])
+                    else:
+                        assign(wid, ["PASS"])
+                else:
+                    m = move_towards(wpos, best_target)
+                    assign(wid, [m] if m else ["PASS"])
+            elif best_type == "weed":
+                available_weeds.remove(best_target)
+                if list(wpos) == list(best_target):
+                    assign(wid, ["DIG"])
+                else:
+                    m = move_towards(wpos, best_target)
+                    assign(wid, [m] if m else ["PASS"])
+        else:
             break
-        assign_task(task)
 
     # Idle workers: hover near the shed where pickups/drops happen.
     for wid in list(unassigned.keys()):
