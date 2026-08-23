@@ -258,7 +258,7 @@ def build_market(state):
             money -= cost
 
     # ---- HIRE farm hands (Dynamic calculation) ----
-    if hour == 0 and 1 <= day <= 24 and money > 50:
+    if hour == 0 and 1 <= day <= 28 and money > 50:
         tasks_today = 0
         tasks_today += len(state.plants())
         tasks_today += state.animals_on_farm() * 3
@@ -450,6 +450,29 @@ def agent(obs):
     for x, y in state.harvestable_animals():
         p2_tasks.append(("HARVEST", [x, y], None, []))
 
+    waiting_animals = state.animals_in_shed()
+    if waiting_animals > 0:
+        free_coops = [(x, y, t) for x, y, t in state.empty_structures() if t.get("kind") == "COOP"]
+        for (x, y, t) in free_coops[:waiting_animals]:
+            p3_tasks.append(("PLACE", [x, y], "GOOSE", ["GOOSE"]))
+            
+        deficit = waiting_animals - len(free_coops)
+        if deficit > 0:
+            empty = state.empty_tiles()
+            if empty:
+                build_targets = sorted(empty, key=lambda p: manhattan_distance(p, (HALF - 1, HALF - 1)))
+                for _ in range(min(deficit, 2, len(build_targets))):
+                    p = build_targets.pop(0)
+                    p3_tasks.append(("BUILD_COOP", list(p), None, []))
+
+    for x, y, t in state.animals():
+        if not t.get("fed_today", False) and (x, y) not in feed_queued:
+            p3_tasks.append(("FEED", [x, y], "WHEAT", []))
+        if not t.get("cared_today", False):
+            p3_tasks.append(("CARE", [x, y], None, []))
+        if t.get("fertilizer_available", False):
+            p3_tasks.append(("COLLECT_FERTILIZER", [x, y], None, []))
+
     for x, y, t in state.plants():
         if (x, y) in water_queued or t.get("watered_today", False):
             continue
@@ -457,39 +480,17 @@ def agent(obs):
         cd = CROPS[crop]
         if cd["ongoing"]:
             if t.get("fertilized_until_day", -1) >= state.day:
-                p3_tasks.append(("WATER", [x, y], None, []))
+                p4_tasks.append(("WATER", [x, y], None, []))
         else:
             a = state.age(t)
             window_start = (cd["max_yield_day"] + 1) // 2
             if window_start <= a <= cd["max_yield_day"]:
                 if t.get("yield_units", 0) < cd["max_yield"]:
-                    p3_tasks.append(("WATER", [x, y], None, []))
-    for x, y, t in state.animals():
-        if not t.get("fed_today", False) and (x, y) not in feed_queued:
-            p3_tasks.append(("FEED", [x, y], "WHEAT", []))
-    for x, y, t in state.animals():
-        if not t.get("cared_today", False):
-            p3_tasks.append(("CARE", [x, y], None, []))
-        if t.get("fertilizer_available", False):
-            p3_tasks.append(("COLLECT_FERTILIZER", [x, y], None, []))
+                    p4_tasks.append(("WATER", [x, y], None, []))
 
     if state.shed.get("FERTILIZER", 0) > 0:
         for x, y in state.fertilize_candidates():
-            p4_tasks.append(("FERTILIZE", [x, y], "FERTILIZER", []))
-
-    waiting_animals = state.animals_in_shed()
-    if waiting_animals > 0:
-        free_coops = [(x, y, t) for x, y, t in state.empty_structures() if t.get("kind") == "COOP"]
-        if not free_coops:
-            empty = state.empty_tiles()
-            if empty:
-                build_targets = sorted(empty, key=lambda p: manhattan_distance(p, (HALF - 1, HALF - 1)))
-                for _ in range(min(waiting_animals, 2, len(build_targets))):
-                    p = build_targets.pop(0)
-                    p5_tasks.append(("BUILD_COOP", list(p), None, []))
-        else:
-            for (x, y, t) in free_coops[:waiting_animals]:
-                p5_tasks.append(("PLACE", [x, y], "GOOSE", ["GOOSE"]))
+            p5_tasks.append(("FERTILIZE", [x, y], "FERTILIZER", []))
 
     # (P7 planting removed from here; handled dynamically below)
 
