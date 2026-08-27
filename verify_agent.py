@@ -19,13 +19,13 @@ def run_single(agent_a, agent_b, seed=42, label=""):
 
 def main():
     # Fixed agent vs starter agent
-    run_single("agent.py", "starter", seed=42, label="agent-vs-starter")
+    run_single("main.py", "starter", seed=42, label="agent-vs-starter")
 
     # Fixed agent vs pass agent
-    run_single("agent.py", "pass", seed=7, label="agent-vs-pass")
+    run_single("main.py", "pass", seed=7, label="agent-vs-pass")
 
     # Self-play (fixed vs fixed)
-    run_single("agent.py", "agent.py", seed=99, label="self-play")
+    run_single("main.py", "main.py", seed=99, label="self-play")
 
     print("\nAll simulations completed.")
 

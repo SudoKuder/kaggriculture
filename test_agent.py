@@ -1,8 +1,12 @@
 """Targeted unit tests for heuristic fixes in agent.py."""
 from copy import deepcopy
 
-import agent
+import main as agent
 from kaggle_environments.envs.kaggriculture.kaggriculture import CROPS, PRODUCTS, ANIMALS, MARKET_PARAMS
+
+# Force strategic layer off for heuristic tests
+agent._strategic_layer = None
+agent.step_counter = 2  # prevent it from loading weights on step 1
 
 
 def make_obs(day, hour, tiles, shed, seeds, money=5000.0):
@@ -104,9 +108,40 @@ def test_water_only_in_bonus_window():
         f"Unexpected action {a['farmer']} for over-ripe wheat"
 
 
+def test_strategic_layer_scoring():
+    import numpy as np
+    from strategy.features import encode_plan, extract_features
+    from strategy.value_net import ValueNetNumpy
+    from strategy.candidates import generate_candidates
+    
+    # Create a random initialized value net (will give different outputs for different inputs)
+    np.random.seed(42)
+    vnet = ValueNetNumpy()
+    
+    tiles = [[None for x in range(10)] for y in range(10)]
+    shed = {p: 0 for p in PRODUCTS + list(ANIMALS)}
+    seeds = {c: 0 for c in CROPS}
+    obs = make_obs(10, 0, tiles, shed, seeds)
+    
+    features = extract_features(obs)
+    
+    plan1 = {"label": "baseline"}
+    plan2 = {"label": "aggressive_land", "buy_land": True}
+    
+    feat1 = encode_plan(features, plan1)
+    feat2 = encode_plan(features, plan2)
+    
+    score1 = vnet.predict(feat1)
+    score2 = vnet.predict(feat2)
+    
+    print(f"Test strategic layer scoring: plan1={score1:.4f} plan2={score2:.4f}")
+    assert score1 != score2, "Scores for different plans must be different!"
+
+
 if __name__ == "__main__":
     test_melon_hour_gating()
     test_tomato_fertilize()
     test_endgame_liquidation()
     test_water_only_in_bonus_window()
+    test_strategic_layer_scoring()
     print("\nAll targeted tests passed.")

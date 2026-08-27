@@ -1,19 +1,12 @@
-"""Self-play training loop with simulator-backed rollout search.
+"""Self-play training loop with Monte-Carlo value network training.
 
 Core idea: at each day boundary (hour == 0), we:
 1. Generate candidate strategic plans
-2. For each candidate, clone the env and roll forward N days using the
-   heuristic agent for micro-actions, but with the candidate's market
-   overrides applied
-3. Score each rollout's terminal state with V(s) + actual money earned
-4. Pick the best candidate for this day
-5. Record (state_features, final_game_money_delta) as training data
-6. Train V(s) via MSE on accumulated data
-
-The rollouts make training sample-efficient: we don't waste episodes
-learning "does watering matter" — that's already solved.  We only spend
-rollouts on genuinely uncertain things: market timing, opponent reactions,
-and capital allocation.
+2. Use an epsilon-greedy strategy to select a plan (evaluating candidates with a value network V(s, plan))
+3. Record (encoded_features, plan_choice) state at the decision point
+4. Run the game to completion
+5. Pair the recorded state features with the actual final money delta
+6. Train V(s, plan) via MSE on the accumulated data
 """
 
 import os
@@ -33,7 +26,7 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 from kaggle_environments import make
-from strategy.features import extract_features, FEATURE_DIM
+from strategy.features import extract_features, FEATURE_DIM, encode_plan
 from strategy.candidates import generate_candidates
 from strategy.value_net import ValueNetTorch, ValueNetNumpy, torch_to_numpy, save_weights
 from strategy.opponents import OpponentPool
@@ -60,10 +53,13 @@ class StrategicTrainingAgent:
         self.current_plan = None
 
         # Import the heuristic agent — we'll call it directly
-        from main import agent as _heuristic_agent, build_market, GameState
-        self._heuristic = _heuristic_agent
-        self._build_market = build_market
-        self._GameState = GameState
+        import main
+        main._strategic_layer = None
+        main.step_counter = 2
+        
+        self._heuristic = main.agent
+        self._build_market = main.build_market
+        self._GameState = main.GameState
 
     def __call__(self, obs, config=None):
         """Called by the kaggle_environments runner each turn."""
@@ -73,7 +69,6 @@ class StrategicTrainingAgent:
         # At hour 0 of each day, make a strategic decision
         if hour == 0:
             features = extract_features(obs)
-            self.recorded_states.append(features)
 
             # Generate and evaluate candidate plans
             candidates = generate_candidates(obs)
@@ -81,14 +76,17 @@ class StrategicTrainingAgent:
                 obs, candidates, features
             )
             self.current_plan = best_plan
-
-        # Run the heuristic agent, applying the current plan's overrides
+            
+            # Record the actual plan chosen for training
+            encoded_feats = self._encode_plan(features, best_plan)
+            self.recorded_states.append(encoded_feats)
+        
+        # Inject the current plan into the heuristic agent's state
+        import main
+        main._current_plan[obs["player"]] = self.current_plan
+        
+        # Run the heuristic agent, which will now automatically budget and apply the overrides
         action = self._heuristic(obs)
-
-        # Override market orders based on the strategic plan
-        if self.current_plan is not None:
-            action["market"] = self._apply_plan(obs, action["market"])
-
         return action
 
     def _evaluate_candidates(self, obs, candidates, features):
@@ -116,116 +114,13 @@ class StrategicTrainingAgent:
         return best_plan, best_score
 
     def _encode_plan(self, features, plan):
-        """Augment feature vector with plan information.
-
-        We don't change the feature dim — instead we use the existing
-        features and trust the value network to learn from the game
-        outcomes which plans lead to better results.
-
-        In practice, during training, different plans lead to different
-        game trajectories, which generate different training targets.
-        The value function learns to predict outcomes from the state
-        alone, and the candidate selection uses that prediction.
-        """
-        # For now, the plan doesn't modify features — the value net
-        # scores the *state* and the plan selection uses exploration
-        # to discover which plans are best from which states.
-        return features
-
-    def _apply_plan(self, obs, market_orders):
-        """Apply the current strategic plan's overrides to market orders."""
-        if self.current_plan is None:
-            return market_orders
-
-        plan = self.current_plan
-        new_orders = []
-
-        # Handle sell overrides
-        sell_hold = plan.get("sell_hold", {})
-        for order in market_orders:
-            if order[0] == "SELL" and len(order) >= 2:
-                product = order[1]
-                if sell_hold.get(product) == "hold":
-                    continue  # skip this sell
-            new_orders.append(order)
-
-        # Handle buy_land override
-        if "buy_land" in plan:
-            if plan["buy_land"] is True:
-                # Force a BUY_LAND order if not already present
-                has_land = any(o[0] == "BUY_LAND" for o in new_orders)
-                if not has_land:
-                    new_orders.append(["BUY_LAND"])
-            elif plan["buy_land"] is False:
-                new_orders = [o for o in new_orders if o[0] != "BUY_LAND"]
-
-        # Handle buy_seed override
-        if "buy_seed" in plan:
-            # Remove existing BUY_SEED orders
-            new_orders = [o for o in new_orders if o[0] != "BUY_SEED"]
-            if plan["buy_seed"] is not None:
-                seed_info = plan["buy_seed"]
-                new_orders.append(
-                    ["BUY_SEED", seed_info["crop"], seed_info["qty"]]
-                )
-
-        # Handle buy_animal override
-        if "buy_animal" in plan:
-            new_orders = [o for o in new_orders if o[0] != "BUY_ANIMAL"]
-            if plan["buy_animal"] is not None:
-                animal_info = plan["buy_animal"]
-                new_orders.append(
-                    ["BUY_ANIMAL", animal_info["type"], animal_info["qty"]]
-                )
-
-        # Handle hire_target override
-        if "hire_target" in plan and plan["hire_target"] is not None:
-            target = plan["hire_target"]
-            n_hands = len(obs["farms"][obs["player"]].get("hands", []))
-            current_workers = 1 + n_hands
-            # Remove existing HIRE orders
-            new_orders = [o for o in new_orders if o[0] != "HIRE"]
-            # Add the right number of hires
-            need = max(0, target - current_workers)
-            for _ in range(need):
-                new_orders.append(["HIRE"])
-
-        # Enforce the 10-order cap
-        return new_orders[:10]
+        """Augment feature vector with plan information."""
+        return encode_plan(features, plan)
 
 
 # ---------------------------------------------------------------------------
-# Rollout-augmented training
+# Training Loop
 # ---------------------------------------------------------------------------
-
-def run_rollout(env, strategic_agent_fn, opponent_fn, rollout_steps):
-    """Clone the env and roll forward ``rollout_steps`` turns.
-
-    Returns the money delta (player 0 - player 1) at the end of the
-    rollout.
-    """
-    clone = env.clone()
-    for _ in range(rollout_steps):
-        if clone.done:
-            break
-        # Get observations for both players
-        obs0 = clone.state[0]["observation"]
-        obs1 = clone.state[1]["observation"]
-
-        act0 = strategic_agent_fn(obs0)
-        if callable(opponent_fn):
-            act1 = opponent_fn(obs1)
-        else:
-            # String agent — let the env handle it (shouldn't happen in
-            # rollouts, but fallback to PASS)
-            act1 = {"farmer": ["PASS"], "hands": [], "market": []}
-
-        clone.step([act0, act1])
-
-    final_obs = clone.state[0]["observation"]
-    m0 = final_obs["farms"][0]["money"]
-    m1 = final_obs["farms"][1]["money"]
-    return m0 - m1
 
 
 def train_value_network(
@@ -366,11 +261,9 @@ def train_value_network(
                 dtype=torch.float32,
             )
 
-            # Normalise targets for stable training
-            # (predict relative to batch mean)
-            target_mean = batch_y.mean()
-            target_std = batch_y.std() + 1e-8
-
+            # Scale targets instead of batch-wise Z-score to maintain stationary targets
+            batch_y = batch_y / 10000.0
+            
             pred = model(batch_x)
             loss = loss_fn(pred, batch_y)
 

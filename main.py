@@ -114,8 +114,15 @@ class _StrategicLayer:
 
     def decide(self, obs):
         """Pick the best candidate plan for this day."""
-        from strategy.features import extract_features
-        from strategy.candidates import generate_candidates
+        try:
+            from strategy.features import extract_features, encode_plan
+            from strategy.candidates import generate_candidates
+        except ImportError as e:
+            # If strategy/ package is missing (e.g. Kaggle single-file submission)
+            # fallback to baseline (empty plan) safely.
+            import sys
+            print(f"[strategy] deployment warning: {e}", file=sys.stderr)
+            return {}
 
         features = extract_features(obs)
         candidates = generate_candidates(obs)
@@ -124,10 +131,9 @@ class _StrategicLayer:
         best_score = -float("inf")
 
         for plan in candidates:
-            score = self.value_net.predict(features)
-            # Bias towards specific plan types based on simple heuristics
-            # so the value net has something to differentiate early on.
-            # These biases wash out as the network trains.
+            plan_features = encode_plan(features, plan)
+            score = self.value_net.predict(plan_features)
+            
             if score > best_score:
                 best_score = score
                 best_plan = plan
@@ -135,53 +141,7 @@ class _StrategicLayer:
         return best_plan
 
 
-def _apply_strategic_plan(obs, market_orders, plan):
-    """Override market orders based on the strategic plan."""
-    if plan is None:
-        return market_orders
 
-    new_orders = list(market_orders)
-
-    # Handle sell overrides
-    sell_hold = plan.get("sell_hold", {})
-    if sell_hold:
-        new_orders = [
-            o for o in new_orders
-            if not (o[0] == "SELL" and len(o) >= 2 and sell_hold.get(o[1]) == "hold")
-        ]
-
-    # Handle buy_land override
-    if "buy_land" in plan:
-        if plan["buy_land"] is True:
-            if not any(o[0] == "BUY_LAND" for o in new_orders):
-                new_orders.append(["BUY_LAND"])
-        elif plan["buy_land"] is False:
-            new_orders = [o for o in new_orders if o[0] != "BUY_LAND"]
-
-    # Handle buy_seed override
-    if "buy_seed" in plan:
-        new_orders = [o for o in new_orders if o[0] != "BUY_SEED"]
-        if plan["buy_seed"] is not None:
-            s = plan["buy_seed"]
-            new_orders.append(["BUY_SEED", s["crop"], s["qty"]])
-
-    # Handle buy_animal override
-    if "buy_animal" in plan:
-        new_orders = [o for o in new_orders if o[0] != "BUY_ANIMAL"]
-        if plan["buy_animal"] is not None:
-            a = plan["buy_animal"]
-            new_orders.append(["BUY_ANIMAL", a["type"], a["qty"]])
-
-    # Handle hire_target override
-    if "hire_target" in plan and plan["hire_target"] is not None:
-        target = plan["hire_target"]
-        n_hands = len(obs["farms"][obs["player"]].get("hands", []))
-        current_workers = 1 + n_hands
-        new_orders = [o for o in new_orders if o[0] != "HIRE"]
-        for _ in range(max(0, target - current_workers)):
-            new_orders.append(["HIRE"])
-
-    return new_orders[:MAX_MARKET_ORDERS]
 
 # Board geometry (default 10x10). The shed sits at the center; its four
 # orthogonally-adjacent access tiles are (4,4) (5,4) (4,5) (5,5).
@@ -360,8 +320,11 @@ def get_closest_worker(target_pos, workers_dict):
     return best
 
 
-def build_market(state):
+def build_market(state, plan=None):
     """Construct market orders; returns up to MAX_MARKET_ORDERS orders."""
+    if plan is None:
+        plan = {}
+        
     day = state.day
     shed = state.shed
     money = float(state.money)
@@ -410,13 +373,12 @@ def build_market(state):
         ("MILK", shed.get("MILK", 0) + total_in_inv("MILK")),
         ("WOOL", shed.get("WOOL", 0) + total_in_inv("WOOL")),
     ]
+    sell_hold = plan.get("sell_hold", {})
     for product, qty in sell_candidates:
         if qty <= 0:
             continue
-        # Sell immediately. Premium goods (MELON/STRAWBERRY/MILK/WOOL) crash to
-        # the $1 floor quickly once a glut forms, and our own bulk sale is the
-        # main glut source — selling ASAP at the still-healthy price beats
-        # holding and waiting for a recovery that our production prevents.
+        if sell_hold.get(product) == "hold":
+            continue
         orders.append(["SELL", product, qty])
 
     # ---- BUY-side orders (hires, land, seeds, animals) are gated to hour==0
@@ -439,35 +401,38 @@ def build_market(state):
             money -= cost
 
     # ---- HIRE farm hands (Dynamic calculation) ----
-    # No hard day cap — hiring stays available as long as the workload demands
-    # it. Late-season animals still need daily feed/care; starving them because
-    # we stopped hiring is worse than the hire cost.
-    if hour == 0 and day >= 1 and money > 50:
-        tasks_today = 0
-        tasks_today += len(state.plants())          # watering
-        tasks_today += state.animals_on_farm() * 3  # feed + care + harvest
-        tasks_today += len(state.harvestable_plants())
-        tasks_today += len(state.harvestable_animals())
-        tasks_today += empty_n                      # planting
-        tasks_today += weeds_n * 2                  # dig + plant
-        tasks_today += len(state.fertilize_candidates())
-        # Animals waiting in the shed need BUILD + PLACE (2 turns each).
-        tasks_today += state.animals_in_shed() * 2
-
-        # Estimate 2 turns per task (1 for action, 1 for movement)
-        turns_needed = tasks_today * 2
-        workers_needed = (turns_needed + 23) // 24
-
-        have_hands = len(state.me["hands"])
-        target = workers_needed
-        need_hires = max(0, (target - 1) - have_hands)
-
-        for i in range(need_hires):
-            hire_idx = have_hands + i
-            cost = [1, 1, 2, 3, 5][hire_idx] if hire_idx < 5 else 8
-            if money >= cost:
-                orders.append(["HIRE"])
-                money -= cost
+    if hour == 0:
+        target = None
+        if "hire_target" in plan and plan["hire_target"] is not None:
+            target = plan["hire_target"]
+            
+        if target is not None or (day >= 1 and money > 50):
+            if target is None:
+                tasks_today = 0
+                tasks_today += len(state.plants())          # watering
+                tasks_today += state.animals_on_farm() * 3  # feed + care + harvest
+                tasks_today += len(state.harvestable_plants())
+                tasks_today += len(state.harvestable_animals())
+                tasks_today += empty_n                      # planting
+                tasks_today += weeds_n * 2                  # dig + plant
+                tasks_today += len(state.fertilize_candidates())
+                # Animals waiting in the shed need BUILD + PLACE (2 turns each).
+                tasks_today += state.animals_in_shed() * 2
+        
+                # Estimate 2 turns per task (1 for action, 1 for movement)
+                turns_needed = tasks_today * 2
+                workers_needed = (turns_needed + 23) // 24
+                target = workers_needed
+        
+            have_hands = len(state.me["hands"])
+            need_hires = max(0, (target - 1) - have_hands)
+        
+            for i in range(need_hires):
+                hire_idx = have_hands + i
+                cost = [1, 1, 2, 3, 5][hire_idx] if hire_idx < 5 else 8
+                if money >= cost:
+                    orders.append(["HIRE"])
+                    money -= cost
 
     # ---- BUY_LAND ----
     # Deliberately NOT gated to hour 0: `money >= land_cost + 500` self-limits
@@ -475,58 +440,91 @@ def build_market(state):
     # (5x5=25 tiles each). Buying the next quadrant as soon as it's affordable
     # massively outweighs the small risk of overspending once.
     land_cost = {1: 1000, 2: 2000, 3: 4000}.get(unlocked, float("inf"))
-    # Late-season land is still productive with fast wheat (buy day 24, plant
-    # immediately, harvest day 29), so keep buying through day 24.
-    if unlocked < 4 and empty_n <= 4 and day <= 24 and money >= land_cost + 500:
-        orders.append(["BUY_LAND"])
-        money -= land_cost
+    buy_land_override = plan.get("buy_land")
+    if buy_land_override is True:
+        if money >= land_cost:
+            orders.append(["BUY_LAND"])
+            money -= land_cost
+    elif buy_land_override is False:
+        pass
+    else:
+        # Original heuristic
+        if money >= land_cost + 500:
+            orders.append(["BUY_LAND"])
+            money -= land_cost
+        else:
+            # Late-season land is still productive with fast wheat (buy day 24, plant
+            # immediately, harvest day 29), so keep buying through day 24.
+            if unlocked < 4 and empty_n <= 4 and day <= 24 and money >= land_cost + 500:
+                orders.append(["BUY_LAND"])
+                money -= land_cost
 
     # ---- BUY_SEED (Dynamic ROI) ----
-    need_seeds = max(0, empty_n + weeds_n - seed_count)
-    hands_n = len(state.me["hands"])
-    seed_burn = hands_n + 1
-    seed_threshold = max(2 * seed_burn, 4)
-    if seed_count < seed_threshold and need_seeds > 0 and day <= 26:
-        best_crop = None
-        best_profit = -float('inf')
-        
-        for crop in CROPS:
-            cd = CROPS[crop]
-            if cd["ongoing"]:
-                time_to_max = cd["first_yield_day"] + cd["interval"] * (cd["max_yield"] - 1)
-            else:
-                time_to_max = cd["max_yield_day"]
-                
-            # Check if it has time to reach max yield before day 29, with 1 day buffer for planting
-            if day + time_to_max + 1 <= 29:
-                market_price = max(1, int(state.market.get("prices", {}).get(crop, 25)))
-                profit_per_day = ((market_price * cd["max_yield"]) - cd["seed"]) / time_to_max
-                
-                if profit_per_day > best_profit:
-                    best_profit = profit_per_day
-                    best_crop = crop
+    buy_seed_override = plan.get("buy_seed")
+    if buy_seed_override is not None:
+        crop = buy_seed_override["crop"]
+        qty = buy_seed_override["qty"]
+        seed_price = CROPS[crop]["seed"]
+        actual_qty = min(qty, int(money // seed_price))
+        if actual_qty > 0:
+            orders.append(["BUY_SEED", crop, actual_qty])
+            money -= actual_qty * seed_price
+    else:
+        need_seeds = max(0, empty_n + weeds_n - seed_count)
+        hands_n = len(state.me["hands"])
+        seed_burn = hands_n + 1
+        seed_threshold = max(2 * seed_burn, 4)
+        if seed_count < seed_threshold and need_seeds > 0 and day <= 26:
+            best_crop = None
+            best_profit = -float('inf')
+            
+            for crop in CROPS:
+                cd = CROPS[crop]
+                if cd["ongoing"]:
+                    time_to_max = cd["first_yield_day"] + cd["interval"] * (cd["max_yield"] - 1)
+                else:
+                    time_to_max = cd["max_yield_day"]
                     
-        if best_crop:
-            seed_price = CROPS[best_crop]["seed"]
-            buy_qty = min(need_seeds, int(money // seed_price))
-            if buy_qty > 0:
-                # Keep a small buffer early game for hiring/wheat
-                max_spend = money - 50 if day < 10 else money
-                buy_qty = min(buy_qty, int(max_spend // seed_price))
+                # Check if it has time to reach max yield before day 29, with 1 day buffer for planting
+                if day + time_to_max + 1 <= 29:
+                    market_price = max(1, int(state.market.get("prices", {}).get(crop, 25)))
+                    profit_per_day = ((market_price * cd["max_yield"]) - cd["seed"]) / time_to_max
+                    
+                    if profit_per_day > best_profit:
+                        best_profit = profit_per_day
+                        best_crop = crop
+                        
+            if best_crop:
+                seed_price = CROPS[best_crop]["seed"]
+                buy_qty = min(need_seeds, int(money // seed_price))
                 if buy_qty > 0:
-                    orders.append(["BUY_SEED", best_crop, buy_qty])
-                    money -= buy_qty * seed_price
+                    # Keep a buffer based on wages to avoid bankruptcy
+                    wage_bill = 15 * (1 + len(state.me["hands"]))
+                    wage_buffer = max(100, wage_bill * 3)
+                    max_spend = money - wage_buffer if day < 10 else money
+                    buy_qty = min(buy_qty, int(max_spend // seed_price))
+                    if buy_qty > 0:
+                        orders.append(["BUY_SEED", best_crop, buy_qty])
+                        money -= buy_qty * seed_price
 
-    # ---- BUY_ANIMAL (max 6 total; 1/day while in the mid-game window) ----
-    # Geese produce daily once placed, and CARE doubles output. A goose bought
-    # day 8 clears its $300 cost by ~day 18; six is a good balance between
-    # income and the wheat feeding burden.
-    if hour == 0 and 8 <= day <= 18:
-        on_farm = state.animals_on_farm()
-        in_shed = state.animals_in_shed()
-        if on_farm + in_shed < MAX_ANIMALS and money >= 350:
-            orders.append(["BUY_ANIMAL", "GOOSE", 1])
-            money -= 300
+    # ---- BUY_ANIMAL ----
+    buy_animal_override = plan.get("buy_animal")
+    if buy_animal_override is not None:
+        a_type = buy_animal_override["type"]
+        a_qty = buy_animal_override["qty"]
+        a_price = ANIMALS[a_type]["cost"]
+        actual_qty = min(a_qty, int(money // a_price))
+        if actual_qty > 0:
+            orders.append(["BUY_ANIMAL", a_type, actual_qty])
+            money -= actual_qty * a_price
+    else:
+        # Geese produce daily once placed, and CARE doubles output. A goose bought
+        # day 8 clears its $300 cost by ~day 18; six is a good balance between
+        # income and the wheat feeding burden.
+        if hour == 0 and 8 <= day <= 18:
+            if animals_n < 6 and money >= ANIMALS["GOOSE"]["cost"] + 100:
+                orders.append(["BUY_ANIMAL", "GOOSE", 1])
+                money -= ANIMALS["GOOSE"]["cost"]
 
     # The env silently drops orders past maxMarketOrdersPerTurn.
     return orders[:MAX_MARKET_ORDERS]
@@ -550,9 +548,8 @@ def agent(obs):
         _current_plan[state.obs["player"]] = _strategic_layer.decide(obs)
         log(f"[strategy] Plan: {_current_plan[state.obs['player']].get('label', '?')}")
 
-    # Build market orders from heuristic, then apply strategic overrides
-    market = build_market(state)
-    market = _apply_strategic_plan(obs, market, _current_plan.get(state.obs["player"]))
+    # Build market orders using heuristic and strategic plan
+    market = build_market(state, plan=_current_plan.get(state.obs["player"]))
 
     hands_n = len(state.me["hands"])
     unassigned = {"farmer": list(state.me["farmer"])}
