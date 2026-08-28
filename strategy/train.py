@@ -15,6 +15,9 @@ import random
 import time
 import math
 from copy import deepcopy
+import glob
+import re
+import gc
 
 import numpy as np
 import torch
@@ -152,14 +155,51 @@ def train_value_network(
     os.makedirs(output_dir, exist_ok=True)
 
     # Initialise model + optimizer
-    model = ValueNetTorch(input_dim=FEATURE_DIM)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if verbose:
+        print(f"Using device: {device}")
+    model = ValueNetTorch(input_dim=FEATURE_DIM).to(device)
     
+    start_episode = 0
     final_path = os.path.join(output_dir, "value_net_final.npz")
+    
+    # 1. Determine start_episode from checkpoints or logs
+    checkpoints = glob.glob(os.path.join(output_dir, "value_net_ep*.npz"))
+    def extract_ep(p):
+        match = re.search(r"value_net_ep(\d+)\.npz", p)
+        return int(match.group(1)) if match else -1
+        
+    if checkpoints:
+        latest_ckpt = max(checkpoints, key=extract_ep)
+        start_episode = extract_ep(latest_ckpt)
+        
+    log_file = os.path.join(output_dir, "logs", "training_metrics.jsonl")
+    if os.path.exists(log_file):
+        try:
+            import json
+            with open(log_file, "r") as f:
+                lines = f.readlines()
+                for line in reversed(lines):
+                    if line.strip():
+                        last_log = json.loads(line)
+                        if "episode" in last_log:
+                            start_episode = max(start_episode, int(last_log["episode"]))
+                        break
+        except Exception:
+            pass
+
+    # 2. Load model weights
+    loaded_path = None
     if os.path.exists(final_path):
+        loaded_path = final_path
+    elif checkpoints:
+        loaded_path = max(checkpoints, key=extract_ep)
+        
+    if loaded_path:
         if verbose:
-            print(f"Resuming training from existing weights at {final_path}")
+            print(f"Resuming training from weights at {loaded_path} (Starting at Episode {start_episode})")
         from strategy.value_net import load_weights
-        layers = load_weights(final_path)
+        layers = load_weights(loaded_path)
         model.import_numpy_weights(layers)
 
     optimizer = optim.Adam(model.parameters(), lr=lr)
@@ -172,6 +212,25 @@ def train_value_network(
         include_passive=True,
         noise_variants=2,
     )
+
+    # Load existing snapshots into the pool
+    if checkpoints:
+        checkpoints_sorted = sorted([c for c in checkpoints if extract_ep(c) > 0], key=extract_ep)
+        if checkpoints_sorted and verbose:
+            print(f"Loading {len(checkpoints_sorted)} previous snapshots into opponent pool...")
+            
+        from strategy.value_net import load_weights
+        for ckpt in checkpoints_sorted:
+            ep = extract_ep(ckpt)
+            try:
+                dummy = ValueNetTorch(input_dim=FEATURE_DIM).to(device)
+                dummy.import_numpy_weights(load_weights(ckpt))
+                snap_vnet = torch_to_numpy(dummy)
+                snap_agent = StrategicTrainingAgent(value_net_numpy=snap_vnet, player_id=1)
+                pool.add_snapshot(snap_agent, label=f"snapshot_ep{ep}")
+            except Exception as e:
+                if verbose:
+                    print(f"Failed to load snapshot {ckpt}: {e}")
 
     # Training data buffer (sliding window)
     data_features = []
@@ -189,7 +248,7 @@ def train_value_network(
 
     t_start = time.time()
 
-    for episode in range(num_episodes):
+    for episode in range(start_episode, num_episodes):
         epsilon = epsilon_start + (epsilon_end - epsilon_start) * (episode / max(1, num_episodes - 1))
         seed = random.randint(0, 100000)
 
@@ -223,6 +282,10 @@ def train_value_network(
         try:
             env = make("kaggriculture", configuration={"seed": seed})
             env.run([agent0, opp_agent])
+        except KeyboardInterrupt:
+            if verbose:
+                print("\nTraining interrupted by user (Ctrl+C). Stopping early and saving final weights...")
+            break
         except Exception as e:
             if verbose:
                 print(f"  Episode {episode}: ERROR ({e}), skipping")
@@ -255,11 +318,11 @@ def train_value_network(
             batch_x = torch.tensor(
                 np.array([data_features[i] for i in indices]),
                 dtype=torch.float32,
-            )
+            ).to(device)
             batch_y = torch.tensor(
                 np.array([data_targets[i] for i in indices]),
                 dtype=torch.float32,
-            )
+            ).to(device)
 
             # Scale targets instead of batch-wise Z-score to maintain stationary targets
             batch_y = batch_y / 10000.0
@@ -310,6 +373,7 @@ def train_value_network(
                 
             running_loss = 0.0
             loss_count = 0
+            gc.collect()
 
         # Checkpoint
         if (episode + 1) % checkpoint_interval == 0:
