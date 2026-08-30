@@ -67,10 +67,11 @@ def generate_candidates(obs):
 
     # --- Plan 1: AGGRESSIVE LAND ---
     if unlocked < 4 and _can_afford(money, land_cost, 200) and day <= 24:
-        candidates.append({
-            "buy_land": True,
-            "label": "aggressive_land",
-        })
+        if unlocked < 3 or _can_afford(money, land_cost, 3000):
+            candidates.append({
+                "buy_land": True,
+                "label": "aggressive_land",
+            })
 
     # --- Plan 2: HOLD PREMIUM GOODS ---
     # Only makes sense if we have premium goods in shed and it's not endgame
@@ -90,8 +91,8 @@ def generate_candidates(obs):
         })
 
     # --- Plan 4: ANIMAL RUSH (buy geese aggressively) ---
-    if total_animals < 6 and day <= 18 and _can_afford(money, 300, 200):
-        n_buy = min(2, 6 - total_animals)
+    if total_animals < 30 and day <= 22 and _can_afford(money, 300, 200):
+        n_buy = min(4, 30 - total_animals)
         if _can_afford(money, 300 * n_buy, 200):
             candidates.append({
                 "buy_animal": {"type": "GOOSE", "qty": n_buy},
@@ -121,12 +122,12 @@ def generate_candidates(obs):
     # --- Plan 7: HIRE HEAVY ---
     if day <= 20 and _can_afford(money, 15, 100):
         candidates.append({
-            "hire_target": 5,
+            "hire_target": 14,
             "label": "hire_heavy",
         })
 
     # --- Plan 8: COW INVESTMENT (if day allows ROI) ---
-    if day <= 14 and total_animals < 6 and _can_afford(money, 400, 300):
+    if day <= 18 and total_animals < 30 and _can_afford(money, 400, 300):
         candidates.append({
             "buy_animal": {"type": "COW", "qty": 1},
             "label": "cow_invest",
@@ -141,6 +142,13 @@ def generate_candidates(obs):
                 "buy_seed": {"crop": "WHEAT", "qty": wheat_qty},
                 "label": f"wheat_economy_{wheat_qty}",
             })
+
+    # --- Plan 10: SHEEP INVESTMENT (if day allows ROI) ---
+    if day <= 16 and total_animals < 30 and _can_afford(money, 600, 300):
+        candidates.append({
+            "buy_animal": {"type": "SHEEP", "qty": 1},
+            "label": "sheep_invest",
+        })
 
     # Always have at least 2 candidates (baseline + one alternative)
     if len(candidates) < 2:

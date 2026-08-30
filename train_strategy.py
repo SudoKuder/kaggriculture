@@ -57,9 +57,11 @@ def smoke_test():
         },
     }
     features = extract_features(obs)
+    from strategy.features import encode_plan
+    features = encode_plan(features, None)
     print(f"   Feature vector: shape={features.shape}, "
           f"range=[{features.min():.3f}, {features.max():.3f}]")
-    assert features.shape == (64,), f"Expected (64,), got {features.shape}"
+    assert features.shape == (78,), f"Expected (78,), got {features.shape}"
     print("   [OK] Feature extraction OK")
 
     # 2. Candidate generation
@@ -76,7 +78,7 @@ def smoke_test():
     print("\n3. Testing value network...")
     import torch
     model = ValueNetTorch()
-    x = torch.randn(1, 64)
+    x = torch.randn(1, 78)
     y = model(x)
     print(f"   PyTorch forward: input={x.shape} -> output={y.shape}, val={y.item():.4f}")
 

@@ -29,7 +29,7 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 from kaggle_environments import make
-from strategy.features import extract_features, FEATURE_DIM, encode_plan
+from strategy.features import extract_features, FEATURE_DIM, encode_plan, _log_money
 from strategy.candidates import generate_candidates
 from strategy.value_net import ValueNetTorch, ValueNetNumpy, torch_to_numpy, save_weights
 from strategy.opponents import OpponentPool
@@ -313,31 +313,31 @@ def train_value_network(
         if len(data_features) >= batch_size:
             model.train()
 
-            # Sample a mini-batch
-            indices = random.sample(range(len(data_features)), batch_size)
-            batch_x = torch.tensor(
-                np.array([data_features[i] for i in indices]),
-                dtype=torch.float32,
-            ).to(device)
-            batch_y = torch.tensor(
-                np.array([data_targets[i] for i in indices]),
-                dtype=torch.float32,
-            ).to(device)
-
-            # Scale targets instead of batch-wise Z-score to maintain stationary targets
-            batch_y = batch_y / 10000.0
-            
-            pred = model(batch_x)
-            loss = loss_fn(pred, batch_y)
-
-            optimizer.zero_grad()
-            loss.backward()
-            # Gradient clipping for stability
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-
-            running_loss += loss.item()
-            loss_count += 1
+            # Perform multiple batch updates to utilize the newly collected samples effectively
+            num_updates = max(1, len(agent0.recorded_states) // (batch_size // 4))
+            for _ in range(num_updates):
+                # Sample a mini-batch
+                indices = random.sample(range(len(data_features)), batch_size)
+                batch_x = torch.tensor(
+                    np.array([data_features[i] for i in indices]),
+                    dtype=torch.float32,
+                ).to(device)
+                batch_y = torch.tensor(
+                    np.array([_log_money(data_targets[i]) for i in indices]),
+                    dtype=torch.float32,
+                ).to(device)
+    
+                pred = model(batch_x)
+                loss = loss_fn(pred, batch_y)
+    
+                optimizer.zero_grad()
+                loss.backward()
+                # Gradient clipping for stability
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+    
+                running_loss += loss.item()
+                loss_count += 1
 
         # Logging
         if verbose and (episode + 1) % 10 == 0:

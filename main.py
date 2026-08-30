@@ -3,6 +3,11 @@
 from kaggle_environments.envs.kaggriculture.kaggriculture import CROPS, PRODUCTS, ANIMALS, MARKET_PARAMS
 
 import os as _os
+import sys as _sys
+if _os.path.exists("/kaggle_simulations/agent/") and "/kaggle_simulations/agent/" not in _sys.path:
+    _sys.path.insert(0, "/kaggle_simulations/agent/")
+elif "__file__" in globals():
+    _sys.path.insert(0, _os.path.dirname(__file__))
 import numpy as _np
 
 # Global counter to track steps (for logging)
@@ -72,7 +77,7 @@ def _try_load_strategy():
             except Exception as e:
                 log(f"[strategy] failed to load {path}: {e}")
     try:
-        return _StrategicLayer(_load_inline_weights())
+        return _StrategicLayer(_ValueNetNumpy(_load_inline_weights()))
     except Exception as e:
         log(f"[strategy] failed to load inline weights: {e}")
     return None
@@ -151,7 +156,7 @@ MAX_MARKET_ORDERS = 10
 SEASON = 30  # days 0..29 (0-indexed)
 
 BUY_WHEAT_TOP = 15      # max feed-wheat units bought per turn
-MAX_ANIMALS = 6         # max animals on farm + shed combined
+MAX_ANIMALS = 30        # max animals on farm + shed combined
 
 
 def log(*args):
@@ -406,7 +411,7 @@ def build_market(state, plan=None):
         if "hire_target" in plan and plan["hire_target"] is not None:
             target = plan["hire_target"]
             
-        if target is not None or (day >= 1 and money > 50):
+        if target is not None or (day >= 1 and money > 0):
             if target is None:
                 tasks_today = 0
                 tasks_today += len(state.plants())          # watering
@@ -420,9 +425,10 @@ def build_market(state, plan=None):
                 tasks_today += state.animals_in_shed() * 2
         
                 # Estimate 2 turns per task (1 for action, 1 for movement)
-                turns_needed = tasks_today * 2
-                workers_needed = (turns_needed + 23) // 24
-                target = workers_needed
+                turns_needed = tasks_today * 2.5
+                workers_needed = int((turns_needed + 23) // 24)
+                # Cap the maximum number of hired hands to prevent ruinous Fibonacci wages
+                target = min(workers_needed, 6)
         
             have_hands = len(state.me["hands"])
             need_hires = max(0, (target - 1) - have_hands)
@@ -448,14 +454,16 @@ def build_market(state, plan=None):
     elif buy_land_override is False:
         pass
     else:
-        # Original heuristic
-        if money >= land_cost + 500:
+        # Original heuristic modified to cap land unlocks to 3 quadrants unless wealthy
+        should_unlock = unlocked < 3 or (unlocked == 3 and money >= land_cost + 3000)
+        
+        if should_unlock and money >= land_cost + 500:
             orders.append(["BUY_LAND"])
             money -= land_cost
         else:
             # Late-season land is still productive with fast wheat (buy day 24, plant
             # immediately, harvest day 29), so keep buying through day 24.
-            if unlocked < 4 and empty_n <= 4 and day <= 24 and money >= land_cost + 500:
+            if should_unlock and unlocked < 4 and empty_n <= 4 and day <= 24 and money >= land_cost + 500:
                 orders.append(["BUY_LAND"])
                 money -= land_cost
 
@@ -467,8 +475,9 @@ def build_market(state, plan=None):
         seed_price = CROPS[crop]["seed"]
         actual_qty = min(qty, int(money // seed_price))
         if actual_qty > 0:
-            orders.append(["BUY_SEED", crop, actual_qty])
-            money -= actual_qty * seed_price
+            if crop != "MELON" or hour == 0:
+                orders.append(["BUY_SEED", crop, actual_qty])
+                money -= actual_qty * seed_price
     else:
         need_seeds = max(0, empty_n + weeds_n - seed_count)
         hands_n = len(state.me["hands"])
@@ -479,14 +488,16 @@ def build_market(state, plan=None):
             best_profit = -float('inf')
             
             for crop in CROPS:
+                if crop == "MELON" and hour != 0:
+                    continue
                 cd = CROPS[crop]
                 if cd["ongoing"]:
                     time_to_max = cd["first_yield_day"] + cd["interval"] * (cd["max_yield"] - 1)
                 else:
                     time_to_max = cd["max_yield_day"]
                     
-                # Check if it has time to reach max yield before day 29, with 1 day buffer for planting
-                if day + time_to_max + 1 <= 29:
+                # Check if it can yield before the season ends
+                if day + cd["first_yield_day"] <= 29:
                     market_price = max(1, int(state.market.get("prices", {}).get(crop, 25)))
                     profit_per_day = ((market_price * cd["max_yield"]) - cd["seed"]) / time_to_max
                     
@@ -503,6 +514,8 @@ def build_market(state, plan=None):
                     wage_buffer = max(100, wage_bill * 3)
                     max_spend = money - wage_buffer if day < 10 else money
                     buy_qty = min(buy_qty, int(max_spend // seed_price))
+                    if day < 5:
+                        buy_qty = min(buy_qty, 15)
                     if buy_qty > 0:
                         orders.append(["BUY_SEED", best_crop, buy_qty])
                         money -= buy_qty * seed_price
@@ -519,10 +532,16 @@ def build_market(state, plan=None):
             money -= actual_qty * a_price
     else:
         # Geese produce daily once placed, and CARE doubles output. A goose bought
-        # day 8 clears its $300 cost by ~day 18; six is a good balance between
-        # income and the wheat feeding burden.
-        if hour == 0 and 8 <= day <= 18:
-            if animals_n < 6 and money >= ANIMALS["GOOSE"]["cost"] + 100:
+        # day 8 clears its $300 cost by ~day 18.
+        # Cows and Sheep are great endgame engines, so we prioritize them early.
+        if hour == 0:
+            if 0 <= day <= 20 and animals_n < MAX_ANIMALS and money >= ANIMALS["COW"]["cost"] + 300:
+                orders.append(["BUY_ANIMAL", "COW", 1])
+                money -= ANIMALS["COW"]["cost"]
+            elif 0 <= day <= 18 and animals_n < MAX_ANIMALS and money >= ANIMALS["SHEEP"]["cost"] + 300:
+                orders.append(["BUY_ANIMAL", "SHEEP", 1])
+                money -= ANIMALS["SHEEP"]["cost"]
+            elif 0 <= day <= 24 and animals_n < MAX_ANIMALS and money >= ANIMALS["GOOSE"]["cost"] + 100:
                 orders.append(["BUY_ANIMAL", "GOOSE", 1])
                 money -= ANIMALS["GOOSE"]["cost"]
 
@@ -812,6 +831,8 @@ def agent(obs):
             empty_set.remove(pos)
             
     available_empty = list(empty_set)
+    if not seed_pool:
+        available_empty = []
     available_weeds = state.weeds()
 
     while (available_empty or available_weeds) and unassigned:

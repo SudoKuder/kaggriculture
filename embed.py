@@ -18,7 +18,7 @@ new_code = parts[0] + insert_marker + '\n\n# --- BEGIN INLINE WEIGHTS ---\n' + i
 load_marker = 'return None\n'
 new_code = new_code.replace(
     'return None\n',
-    'try:\n        return _StrategicLayer(_load_inline_weights())\n    except Exception as e:\n        log(f"[strategy] failed to load inline weights: {e}")\n    return None\n'
+    'try:\n        return _StrategicLayer(_ValueNetNumpy(_load_inline_weights()))\n    except Exception as e:\n        log(f"[strategy] failed to load inline weights: {e}")\n    return None\n'
 )
 
 with open('main.py', 'w', encoding='utf-8') as f:
