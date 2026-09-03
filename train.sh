@@ -2,7 +2,7 @@
 set -e
 
 echo "Installing requirements..."
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 
 echo -e "\nStarting training..."
 python train_strategy.py --episodes 2000

@@ -1,6 +1,6 @@
 @echo off
 echo Installing requirements...
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 echo.
 echo Starting training...
 python train_strategy.py --episodes 2000
