@@ -22,9 +22,9 @@ import time
 # Ensure repo root is on path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from strategy.train import train_value_network
-from strategy.value_net import (
-    ValueNetTorch, torch_to_numpy, save_weights, load_weights, ValueNetNumpy,
+from strategy.train import train_actor_network
+from strategy.actor_net import (
+    ActorNetTorch, torch_to_numpy, save_weights, load_weights, ActorNetNumpy,
 )
 from strategy.features import extract_features
 
@@ -57,11 +57,10 @@ def smoke_test():
         },
     }
     features = extract_features(obs)
-    from strategy.features import encode_plan
-    features = encode_plan(features, None)
+    features = extract_features(obs)
     print(f"   Feature vector: shape={features.shape}, "
           f"range=[{features.min():.3f}, {features.max():.3f}]")
-    assert features.shape == (78,), f"Expected (78,), got {features.shape}"
+    assert features.shape == (64,), f"Expected (64,), got {features.shape}"
     print("   [OK] Feature extraction OK")
 
     # 2. Candidate generation
@@ -74,22 +73,22 @@ def smoke_test():
     assert candidates[0]["label"] == "baseline", "First candidate must be baseline"
     print("   [OK] Candidate generation OK")
 
-    # 3. Value network
-    print("\n3. Testing value network...")
+    # 3. Actor network
+    print("\n3. Testing actor network...")
     import torch
-    model = ValueNetTorch()
-    x = torch.randn(1, 78)
+    model = ActorNetTorch()
+    x = torch.randn(1, 64)
     y = model(x)
-    print(f"   PyTorch forward: input={x.shape} -> output={y.shape}, val={y.item():.4f}")
+    print(f"   PyTorch forward: input={x.shape} -> output={y.shape}")
 
     # Numpy equivalence
     vnet_np = torch_to_numpy(model)
-    y_np = vnet_np.predict(features)
-    y_torch = model(torch.tensor(features).unsqueeze(0)).item()
-    diff = abs(y_np - y_torch)
-    print(f"   Numpy forward: val={y_np:.4f}, PyTorch: val={y_torch:.4f}, diff={diff:.6f}")
+    action_np = vnet_np.predict(features)
+    action_dict, _, _ = model.get_action(torch.tensor(features).unsqueeze(0), deterministic=True)
+    diff = abs(action_np["buy_seed_frac"] - torch.sigmoid(model(torch.tensor(features).unsqueeze(0))[..., 21]).item())
+    print(f"   Numpy forward: val={action_np['buy_seed_frac']:.4f}, PyTorch: diff={diff:.6f}")
     assert diff < 1e-4, f"Numpy/PyTorch mismatch: {diff}"
-    print("   [OK] Value network OK")
+    print("   [OK] Actor network OK")
 
     # 4. Weight save/load
     print("\n4. Testing weight serialization...")
@@ -98,9 +97,9 @@ def smoke_test():
     layers = model.export_numpy_weights()
     save_weights(layers, test_path)
     loaded = load_weights(test_path)
-    vnet_loaded = ValueNetNumpy(loaded)
-    y_loaded = vnet_loaded.predict(features)
-    diff2 = abs(y_loaded - y_np)
+    vnet_loaded = ActorNetNumpy(loaded)
+    action_loaded = vnet_loaded.predict(features)
+    diff2 = abs(action_loaded["buy_seed_frac"] - action_np["buy_seed_frac"])
     print(f"   Save/load roundtrip: diff={diff2:.6f}")
     assert diff2 < 1e-6, f"Save/load mismatch: {diff2}"
     os.remove(test_path)
@@ -170,11 +169,10 @@ def main():
     print("=" * 60)
 
     t0 = time.time()
-    model = train_value_network(
+    model = train_actor_network(
         num_episodes=args.episodes,
         batch_size=args.batch_size,
         lr=args.lr,
-        rollout_depth_days=args.rollout_days,
         checkpoint_interval=args.checkpoint_interval,
         output_dir=args.output_dir,
         verbose=True,
@@ -182,11 +180,11 @@ def main():
     elapsed = time.time() - t0
 
     print(f"\nTotal training time: {elapsed / 60:.1f} minutes")
-    print(f"Weights saved to: {args.output_dir}/value_net_final.npz")
+    print(f"Weights saved to: {args.output_dir}/actor_net_final.npz")
     print("\nNext steps:")
     print(f"  1. Run benchmark: python benchmark.py")
     print(f"  2. Export for submission:")
-    print(f"     python -m strategy.export_weights {args.output_dir}/value_net_final.npz -o strategy_weights_inline.py")
+    print(f"     python -m strategy.export_weights {args.output_dir}/actor_net_final.npz -o strategy_weights_inline.py")
 
 
 if __name__ == "__main__":

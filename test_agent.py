@@ -108,15 +108,13 @@ def test_water_only_in_bonus_window():
         f"Unexpected action {a['farmer']} for over-ripe wheat"
 
 
-def test_strategic_layer_scoring():
+def test_strategic_layer_actor():
     import numpy as np
-    from strategy.features import encode_plan, extract_features
-    from strategy.value_net import ValueNetNumpy
-    from strategy.candidates import generate_candidates
+    from strategy.features import extract_features
+    from strategy.actor_net import ActorNetNumpy
     
-    # Create a random initialized value net (will give different outputs for different inputs)
     np.random.seed(42)
-    vnet = ValueNetNumpy()
+    anet = ActorNetNumpy()
     
     tiles = [[None for x in range(10)] for y in range(10)]
     shed = {p: 0 for p in PRODUCTS + list(ANIMALS)}
@@ -125,17 +123,12 @@ def test_strategic_layer_scoring():
     
     features = extract_features(obs)
     
-    plan1 = {"label": "baseline"}
-    plan2 = {"label": "aggressive_land", "buy_land": True}
+    action = anet.predict(features)
     
-    feat1 = encode_plan(features, plan1)
-    feat2 = encode_plan(features, plan2)
-    
-    score1 = vnet.predict(feat1)
-    score2 = vnet.predict(feat2)
-    
-    print(f"Test strategic layer scoring: plan1={score1:.4f} plan2={score2:.4f}")
-    assert score1 != score2, "Scores for different plans must be different!"
+    print(f"Test strategic layer actor: action={action}")
+    assert "buy_land" in action, "Action should contain buy_land"
+    assert "hire_target" in action, "Action should contain hire_target"
+    assert "sell_hold" in action, "Action should contain sell_hold"
 
 
 if __name__ == "__main__":
@@ -143,5 +136,5 @@ if __name__ == "__main__":
     test_tomato_fertilize()
     test_endgame_liquidation()
     test_water_only_in_bonus_window()
-    test_strategic_layer_scoring()
+    test_strategic_layer_actor()
     print("\nAll targeted tests passed.")

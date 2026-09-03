@@ -23,60 +23,7 @@ SHOP_TYPES = [
     "ICE_CREAM_SHOP", "PET_CAFE", "SMOOTHIE_SHOP", "FARMERS_MARKET",
 ]
 
-FEATURE_DIM = 78  # 64 state features + 14 plan features
-
-def encode_plan(features, plan):
-    """Augment the 64-dim state feature vector with a 14-dim plan encoding.
-    
-    Plan Encoding (14 dims):
-    [0]: buy_land (1.0 for True, -1.0 for False, 0.0 for None)
-    [1]: hire_target (target / 6.0, or 0.0 if None)
-    [2-5]: sell_hold premium goods (1.0 for hold, 0.0 for sell/None) 
-           Order: MELON, STRAWBERRY, MILK, WOOL
-    [6-10]: buy_seed crop qty / 100.0 (WHEAT, CARROT, TOMATO, STRAWBERRY, MELON)
-    [11-13]: buy_animal qty / 10.0 (GOOSE, COW, SHEEP)
-    """
-    plan_feats = [0.0] * 14
-    
-    if plan is None:
-        plan = {}
-        
-    # 0: buy_land
-    if "buy_land" in plan and plan["buy_land"] is not None:
-        plan_feats[0] = 1.0 if plan["buy_land"] else -1.0
-        
-    # 1: hire_target
-    if "hire_target" in plan and plan["hire_target"] is not None:
-        plan_feats[1] = plan["hire_target"] / 6.0
-        
-    # 2-5: sell_hold premium
-    sell_hold = plan.get("sell_hold", {})
-    premium = ["MELON", "STRAWBERRY", "MILK", "WOOL"]
-    for i, p in enumerate(premium):
-        if sell_hold.get(p) == "hold":
-            plan_feats[2 + i] = 1.0
-            
-    # 6-10: buy_seed
-    buy_seed = plan.get("buy_seed")
-    if buy_seed is not None:
-        try:
-            idx = CROP_ORDER.index(buy_seed["crop"])
-            plan_feats[6 + idx] = buy_seed["qty"] / 100.0
-        except ValueError:
-            pass
-            
-    # 11-13: buy_animal
-    buy_animal = plan.get("buy_animal")
-    if buy_animal is not None:
-        try:
-            idx = ANIMAL_ORDER.index(buy_animal["type"])
-            plan_feats[11 + idx] = buy_animal["qty"] / 10.0
-        except ValueError:
-            pass
-            
-    # Concatenate features and plan_feats
-    return np.concatenate([features, np.array(plan_feats, dtype=np.float32)])
-
+FEATURE_DIM = 64  # 64 state features
 
 def _log_money(m):
     """Log-scaled money.  Handles negatives gracefully."""
