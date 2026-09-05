@@ -16,6 +16,15 @@ def heuristic_agent(obs):
 
 def visualize():
     print("Running match...")
+    
+    # Load specific checkpoint for the main agent
+    checkpoint_path = "./actor_net_ep26300.npz"
+    if os.path.exists(checkpoint_path):
+        main._strategic_layer = main._StrategicLayer.from_npz(checkpoint_path)
+        print(f"Loaded {checkpoint_path} for main agent")
+    else:
+        print(f"WARNING: {checkpoint_path} not found! Falling back to default.")
+
     env = make("kaggriculture", configuration={"seed": 42})
     env.run([main.agent, heuristic_agent])
     

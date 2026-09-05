@@ -1,6 +1,6 @@
 """Actor network for the strategic decision layer.
 
-Small MLP mapping state features → continuous action space (26 dims).
+Small MLP mapping state features → continuous action space (38 dims).
 Training uses PyTorch (REINFORCE); inference uses a pure-numpy forward pass
 so the submission stays lightweight and has no cold-start penalty.
 """
@@ -18,21 +18,21 @@ except ImportError:
 
 # 64 state features (without the 14-dim plan encoding)
 FEATURE_DIM = 64
-ACTION_DIM = 31
+ACTION_DIM = 38
 
 # Output dimension indices:
 # [0] buy_land logit (sigmoid)
-# [1:7] hire_target logits (softmax over 1-6)
-# [7:16] sell_hold logits (9 independent sigmoids)
-# [16:21] buy_seed_crop logits (softmax over 5 crops)
-# [21] buy_seed_frac logit (sigmoid)
-# [22:25] buy_animal_type logits (softmax over 3 animals)
-# [25] buy_animal_frac logit (sigmoid)
-# [26] weed_penalty logit (sigmoid -> scale [0, 10])
-# [27] maint_water_hour logit (sigmoid -> scale [0, 23])
-# [28] panic_drop_hour logit (sigmoid -> scale [0, 23])
-# [29] seed_threshold_mult logit (sigmoid -> scale [0, 5])
-# [30] land_unlock_buffer logit (sigmoid -> scale [0, 2000])
+# [1:14] hire_target logits (softmax over 1-13)
+# [14:23] sell_hold logits (9 independent sigmoids)
+# [23:28] buy_seed_crop logits (softmax over 5 crops)
+# [28] buy_seed_frac logit (sigmoid)
+# [29:32] buy_animal_type logits (softmax over 3 animals)
+# [32] buy_animal_frac logit (sigmoid)
+# [33] weed_penalty logit (sigmoid -> scale [0, 10])
+# [34] maint_water_hour logit (sigmoid -> scale [0, 23])
+# [35] panic_drop_hour logit (sigmoid -> scale [0, 23])
+# [36] seed_threshold_mult logit (sigmoid -> scale [0, 5])
+# [37] land_unlock_buffer logit (sigmoid -> scale [0, 2000])
 
 # ---------------------------------------------------------------------------
 # PyTorch model (training only)
@@ -40,7 +40,7 @@ ACTION_DIM = 31
 
 if HAS_TORCH:
     class ActorNetTorch(nn.Module):
-        """64 → 64 → 32 → 26 MLP with ReLU."""
+        """64 → 64 → 32 → 38 MLP with ReLU."""
 
         def __init__(self, input_dim=FEATURE_DIM, output_dim=ACTION_DIM):
             super().__init__()
@@ -67,24 +67,24 @@ if HAS_TORCH:
             a_land = (p_land > 0.5).float() if deterministic else dist_land.sample()
             lp_land = dist_land.log_prob(a_land)
             
-            # 2. hire_target (Categorical 0-5 mapping to 1-6 workers)
-            dist_hire = Categorical(logits=logits[..., 1:7])
-            a_hire = torch.argmax(logits[..., 1:7], dim=-1) if deterministic else dist_hire.sample()
+            # 2. hire_target (Categorical 0-12 mapping to 1-13 workers)
+            dist_hire = Categorical(logits=logits[..., 1:14])
+            a_hire = torch.argmax(logits[..., 1:14], dim=-1) if deterministic else dist_hire.sample()
             lp_hire = dist_hire.log_prob(a_hire)
             
             # 3. sell_hold (9 independent Bernoullis)
-            p_sell = torch.sigmoid(logits[..., 7:16])
+            p_sell = torch.sigmoid(logits[..., 14:23])
             dist_sell = Bernoulli(p_sell)
             a_sell = (p_sell > 0.5).float() if deterministic else dist_sell.sample()
             lp_sell = dist_sell.log_prob(a_sell).sum(dim=-1)
             
             # 4. buy_seed_crop (Categorical 0-4)
-            dist_seed_c = Categorical(logits=logits[..., 16:21])
-            a_seed_c = torch.argmax(logits[..., 16:21], dim=-1) if deterministic else dist_seed_c.sample()
+            dist_seed_c = Categorical(logits=logits[..., 23:28])
+            a_seed_c = torch.argmax(logits[..., 23:28], dim=-1) if deterministic else dist_seed_c.sample()
             lp_seed_c = dist_seed_c.log_prob(a_seed_c)
             
             # 5. buy_seed_frac (Normal with fixed std or just deterministic sigmoid + noise)
-            mean_seed_f = torch.sigmoid(logits[..., 21])
+            mean_seed_f = torch.sigmoid(logits[..., 28])
             std = 0.2
             dist_seed_f = Normal(mean_seed_f, std)
             if deterministic:
@@ -94,12 +94,12 @@ if HAS_TORCH:
             lp_seed_f = dist_seed_f.log_prob(a_seed_f)
             
             # 6. buy_animal_type (Categorical 0-2)
-            dist_anim_t = Categorical(logits=logits[..., 22:25])
-            a_anim_t = torch.argmax(logits[..., 22:25], dim=-1) if deterministic else dist_anim_t.sample()
+            dist_anim_t = Categorical(logits=logits[..., 29:32])
+            a_anim_t = torch.argmax(logits[..., 29:32], dim=-1) if deterministic else dist_anim_t.sample()
             lp_anim_t = dist_anim_t.log_prob(a_anim_t)
             
             # 7. buy_animal_frac (Normal)
-            mean_anim_f = torch.sigmoid(logits[..., 25])
+            mean_anim_f = torch.sigmoid(logits[..., 32])
             dist_anim_f = Normal(mean_anim_f, std)
             if deterministic:
                 a_anim_f = mean_anim_f
@@ -108,27 +108,27 @@ if HAS_TORCH:
             lp_anim_f = dist_anim_f.log_prob(a_anim_f)
             
             # 8. Tactical parameters (Normal distributions)
-            mean_weed = torch.sigmoid(logits[..., 26]) * 10.0
+            mean_weed = torch.sigmoid(logits[..., 33]) * 10.0
             dist_weed = Normal(mean_weed, 1.0)
             a_weed = mean_weed if deterministic else dist_weed.sample().clamp(0.0, 10.0)
             lp_weed = dist_weed.log_prob(a_weed)
             
-            mean_maint = torch.sigmoid(logits[..., 27]) * 23.0
+            mean_maint = torch.sigmoid(logits[..., 34]) * 23.0
             dist_maint = Normal(mean_maint, 2.0)
             a_maint = mean_maint if deterministic else dist_maint.sample().clamp(0.0, 23.0)
             lp_maint = dist_maint.log_prob(a_maint)
             
-            mean_panic = torch.sigmoid(logits[..., 28]) * 23.0
+            mean_panic = torch.sigmoid(logits[..., 35]) * 23.0
             dist_panic = Normal(mean_panic, 2.0)
             a_panic = mean_panic if deterministic else dist_panic.sample().clamp(0.0, 23.0)
             lp_panic = dist_panic.log_prob(a_panic)
             
-            mean_seed_m = torch.sigmoid(logits[..., 29]) * 5.0
+            mean_seed_m = torch.sigmoid(logits[..., 36]) * 5.0
             dist_seed_m = Normal(mean_seed_m, 0.5)
             a_seed_m = mean_seed_m if deterministic else dist_seed_m.sample().clamp(0.0, 5.0)
             lp_seed_m = dist_seed_m.log_prob(a_seed_m)
             
-            mean_land_b = torch.sigmoid(logits[..., 30]) * 2000.0
+            mean_land_b = torch.sigmoid(logits[..., 37]) * 2000.0
             dist_land_b = Normal(mean_land_b, 200.0)
             a_land_b = mean_land_b if deterministic else dist_land_b.sample().clamp(0.0, 2000.0)
             lp_land_b = dist_land_b.log_prob(a_land_b)
@@ -204,17 +204,17 @@ class ActorNetNumpy:
         
         return {
             "buy_land": self._sigmoid(logits[0]),
-            "hire_target": np.argmax(logits[1:7]),
-            "sell_hold": self._sigmoid(logits[7:16]),
-            "buy_seed_crop": np.argmax(logits[16:21]),
-            "buy_seed_frac": self._sigmoid(logits[21]),
-            "buy_animal_type": np.argmax(logits[22:25]),
-            "buy_animal_frac": self._sigmoid(logits[25]),
-            "weed_penalty": self._sigmoid(logits[26]) * 10.0,
-            "maint_water_hour": self._sigmoid(logits[27]) * 23.0,
-            "panic_drop_hour": self._sigmoid(logits[28]) * 23.0,
-            "seed_threshold_mult": self._sigmoid(logits[29]) * 5.0,
-            "land_unlock_buffer": self._sigmoid(logits[30]) * 2000.0,
+            "hire_target": np.argmax(logits[1:14]),
+            "sell_hold": self._sigmoid(logits[14:23]),
+            "buy_seed_crop": np.argmax(logits[23:28]),
+            "buy_seed_frac": self._sigmoid(logits[28]),
+            "buy_animal_type": np.argmax(logits[29:32]),
+            "buy_animal_frac": self._sigmoid(logits[32]),
+            "weed_penalty": self._sigmoid(logits[33]) * 10.0,
+            "maint_water_hour": self._sigmoid(logits[34]) * 23.0,
+            "panic_drop_hour": self._sigmoid(logits[35]) * 23.0,
+            "seed_threshold_mult": self._sigmoid(logits[36]) * 5.0,
+            "land_unlock_buffer": self._sigmoid(logits[37]) * 2000.0,
         }
 
 # ---------------------------------------------------------------------------

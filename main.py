@@ -61,6 +61,16 @@ def _try_load_strategy():
     Called once on first agent() invocation.  Returns a _StrategicLayer
     or None.
     """
+    # Expected output dimension for the current action space.
+    _EXPECTED_ACTION_DIM = 38
+
+    def _valid_layers(layers):
+        """Check that the last layer's output matches the expected action dim."""
+        if not layers:
+            return False
+        W_last, b_last, _ = layers[-1]
+        return b_last.shape[0] == _EXPECTED_ACTION_DIM
+
     # Look for weights file next to this script.  In exec() contexts
     # (kaggle runner) __file__ is not defined, so fall back to cwd.
     try:
@@ -85,11 +95,17 @@ def _try_load_strategy():
     for path in candidates:
         if _os.path.isfile(path):
             try:
-                return _StrategicLayer.from_npz(path)
+                layer = _StrategicLayer.from_npz(path)
+                if _valid_layers(layer.actor_net.layers):
+                    return layer
+                log(f"[strategy] skipping {path}: output dim mismatch (need {_EXPECTED_ACTION_DIM})")
             except Exception as e:
                 log(f"[strategy] failed to load {path}: {e}")
     try:
-        return _StrategicLayer(_ActorNetNumpy(_load_inline_weights()))
+        layers = _load_inline_weights()
+        if _valid_layers(layers):
+            return _StrategicLayer(_ActorNetNumpy(layers))
+        log(f"[strategy] inline weights have wrong output dim (need {_EXPECTED_ACTION_DIM}), skipping")
     except Exception as e:
         log(f"[strategy] failed to load inline weights: {e}")
     return None
@@ -115,17 +131,17 @@ class _ActorNetNumpy:
         
         return {
             "buy_land": self._sigmoid(logits[0]),
-            "hire_target": int(_np.argmax(logits[1:7])) + 1,
-            "sell_hold": self._sigmoid(logits[7:16]),
-            "buy_seed_crop": int(_np.argmax(logits[16:21])),
-            "buy_seed_frac": self._sigmoid(logits[21]),
-            "buy_animal_type": int(_np.argmax(logits[22:25])),
-            "buy_animal_frac": self._sigmoid(logits[25]),
-            "weed_penalty": self._sigmoid(logits[26]) * 10.0,
-            "maint_water_hour": self._sigmoid(logits[27]) * 23.0,
-            "panic_drop_hour": self._sigmoid(logits[28]) * 23.0,
-            "seed_threshold_mult": self._sigmoid(logits[29]) * 5.0,
-            "land_unlock_buffer": self._sigmoid(logits[30]) * 2000.0,
+            "hire_target": int(_np.argmax(logits[1:14])) + 1,
+            "sell_hold": self._sigmoid(logits[14:23]),
+            "buy_seed_crop": int(_np.argmax(logits[23:28])),
+            "buy_seed_frac": self._sigmoid(logits[28]),
+            "buy_animal_type": int(_np.argmax(logits[29:32])),
+            "buy_animal_frac": self._sigmoid(logits[32]),
+            "weed_penalty": self._sigmoid(logits[33]) * 10.0,
+            "maint_water_hour": self._sigmoid(logits[34]) * 23.0,
+            "panic_drop_hour": self._sigmoid(logits[35]) * 23.0,
+            "seed_threshold_mult": self._sigmoid(logits[36]) * 5.0,
+            "land_unlock_buffer": self._sigmoid(logits[37]) * 2000.0,
         }
 
 
@@ -474,7 +490,10 @@ def build_market(state, plan=None):
             money -= cost
 
     # ---- HIRE farm hands (Dynamic calculation) ----
-    if hour == 0:
+    # Widened from hour==0 to hour<=3: if the 10-order-per-turn market cap
+    # prevents hiring the full target at hour 0, remaining hires retry in
+    # subsequent hours (replay data shows hire counts climbing at hours 1-2).
+    if hour <= 3:
         target = None
         if "hire_target" in plan and plan["hire_target"] is not None:
             target = plan["hire_target"]
@@ -495,9 +514,13 @@ def build_market(state, plan=None):
                 # Estimate 2 turns per task (1 for action, 1 for movement)
                 turns_needed = tasks_today * 2.5
                 workers_needed = int((turns_needed + 23) // 24)
-                # Cap the maximum number of hired hands to prevent ruinous Fibonacci wages
-                target = min(workers_needed, 6)
+                # Cap at 12 — the game's real hires_today limit (replay data
+                # confirms hires_today never exceeds 12).
+                target = min(workers_needed, 12)
         
+            # Hands reset to 0 every day at hour 0; state.me["hands"] is the
+            # live observation value so it naturally reflects hires that already
+            # succeeded earlier in the same day.
             have_hands = len(state.me["hands"])
             need_hires = max(0, (target - 1) - have_hands)
         
@@ -513,7 +536,9 @@ def build_market(state, plan=None):
     # the spend, and unlocking quadrants earlier gives far more planting room
     # (5x5=25 tiles each). Buying the next quadrant as soon as it's affordable
     # massively outweighs the small risk of overspending once.
-    land_cost = {1: 1000, 2: 2000, 3: 4000}.get(unlocked, float("inf"))
+    # Only unlock up to 3 quadrants by default. Quadrant 4 ($4000) is negative-ROI
+    # within a 30-day season — no top player in replay data ever unlocked it.
+    land_cost = {1: 1000, 2: 2000}.get(unlocked, float("inf"))
     buy_land_override = plan.get("buy_land")
     if buy_land_override is True:
         if money >= land_cost:
@@ -522,8 +547,10 @@ def build_market(state, plan=None):
     elif buy_land_override is False:
         pass
     else:
-        # Original heuristic modified to cap land unlocks to 3 quadrants unless wealthy
-        should_unlock = unlocked < 3 or (unlocked == 3 and money >= land_cost + 3000)
+        # Hard-cap at 3 quadrants. Across 29 games / 10 independent top players,
+        # Q4 was purchased exactly once — and that player lost to one who stayed
+        # at Q3. Treat as confirmed negative-ROI within a 30-day season.
+        should_unlock = unlocked < 3
         
         land_buffer = plan.get("land_unlock_buffer", 500.0) if plan else 500.0
         if should_unlock and money >= land_cost + land_buffer:
@@ -532,7 +559,7 @@ def build_market(state, plan=None):
         else:
             # Late-season land is still productive with fast wheat (buy day 24, plant
             # immediately, harvest day 29), so keep buying through day 24.
-            if should_unlock and unlocked < 4 and empty_n <= 4 and day <= 24 and money >= land_cost + land_buffer:
+            if should_unlock and unlocked < 3 and empty_n <= 4 and day <= 24 and money >= land_cost + land_buffer:
                 orders.append(["BUY_LAND"])
                 money -= land_cost
 
@@ -601,19 +628,38 @@ def build_market(state, plan=None):
             orders.append(["BUY_ANIMAL", a_type, actual_qty])
             money -= actual_qty * a_price
     else:
-        # Geese produce daily once placed, and CARE doubles output. A goose bought
-        # day 8 clears its $300 cost by ~day 18.
-        # Cows and Sheep are great endgame engines, so we prioritize them early.
-        if hour == 0:
-            if 0 <= day <= 20 and animals_n < MAX_ANIMALS and money >= ANIMALS["COW"]["cost"] + 300:
+        # COW > SHEEP priority, multi-unit buys per day, goose only as last resort.
+        # Top players buy COW×2 + SHEEP×1 bursts on day 0; goose in 0-1 units total.
+        if hour <= 3:
+            # COW: buy as many as affordable (up to order-slot budget)
+            cow_cost = ANIMALS["COW"]["cost"]
+            while (0 <= day <= 20 and animals_n < MAX_ANIMALS
+                   and money >= cow_cost + 300
+                   and len(orders) < MAX_MARKET_ORDERS):
                 orders.append(["BUY_ANIMAL", "COW", 1])
-                money -= ANIMALS["COW"]["cost"]
-            elif 0 <= day <= 18 and animals_n < MAX_ANIMALS and money >= ANIMALS["SHEEP"]["cost"] + 300:
+                money -= cow_cost
+                animals_n += 1
+
+            # SHEEP: buy as many as affordable
+            sheep_cost = ANIMALS["SHEEP"]["cost"]
+            while (0 <= day <= 18 and animals_n < MAX_ANIMALS
+                   and money >= sheep_cost + 300
+                   and len(orders) < MAX_MARKET_ORDERS):
                 orders.append(["BUY_ANIMAL", "SHEEP", 1])
-                money -= ANIMALS["SHEEP"]["cost"]
-            elif 0 <= day <= 24 and animals_n < MAX_ANIMALS and money >= ANIMALS["GOOSE"]["cost"] + 100:
+                money -= sheep_cost
+                animals_n += 1
+
+            # GOOSE: only if both COW and SHEEP are already at saturation,
+            # and only 1 unit max per game (top players buy 0-1 total).
+            goose_count = sum(1 for _, _, t in state.animals() if t.get("animal") == "GOOSE")
+            goose_count += state.shed.get("GOOSE", 0)
+            if (goose_count == 0 and 0 <= day <= 10
+                    and animals_n < MAX_ANIMALS
+                    and money >= ANIMALS["GOOSE"]["cost"] + 500
+                    and len(orders) < MAX_MARKET_ORDERS):
                 orders.append(["BUY_ANIMAL", "GOOSE", 1])
                 money -= ANIMALS["GOOSE"]["cost"]
+                animals_n += 1
 
     # The env silently drops orders past maxMarketOrdersPerTurn.
     return orders[:MAX_MARKET_ORDERS]

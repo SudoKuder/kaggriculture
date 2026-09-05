@@ -44,10 +44,9 @@ class StrategicTrainingAgent:
     training episodes. Records state features and actions.
     """
 
-    def __init__(self, actor_net_torch, player_id=0, epsilon=0.0):
+    def __init__(self, actor_net_torch, player_id=0):
         self.actor_net = actor_net_torch
         self.player_id = player_id
-        self.epsilon = epsilon
         self.recorded_transitions = []  # list of (features, action_dict)
         self.current_plan = None
 
@@ -74,46 +73,8 @@ class StrategicTrainingAgent:
                 device = next(self.actor_net.parameters()).device if hasattr(self.actor_net, "parameters") else "cpu"
                 feat_tensor = torch.tensor(features, dtype=torch.float32).unsqueeze(0).to(device)
                 
-                # Epsilon-greedy (random action) vs sampled action
-                if random.random() < self.epsilon:
-                    # Biased random actions for exploration
-                    a_land = float(random.random() > 0.8)
-                    a_hire = random.randint(0, 2)
-                    a_sell = [float(random.random() < 0.1) for _ in range(9)]
-                    if random.random() < 0.7:
-                        a_seed_c = 0
-                        a_seed_f = random.random() * 0.5
-                    else:
-                        a_seed_c = random.randint(0, 4)
-                        a_seed_f = 0.6 + random.random() * 0.4
-                    if random.random() < 0.9:
-                        a_anim_t = 0
-                        a_anim_f = random.random() * 0.5
-                    else:
-                        a_anim_t = random.randint(0, 2)
-                        a_anim_f = 0.6 + random.random() * 0.4
-                    a_weed = 5.0
-                    a_maint = 21.0
-                    a_panic = 22.0
-                    a_seed_m = 2.0
-                    a_land_b = 500.0
-                    
-                    action_dict = {
-                        "buy_land": torch.tensor([a_land]),
-                        "hire_target": torch.tensor([a_hire]),
-                        "sell_hold": torch.tensor([a_sell]),
-                        "buy_seed_crop": torch.tensor([a_seed_c]),
-                        "buy_seed_frac": torch.tensor([a_seed_f]),
-                        "buy_animal_type": torch.tensor([a_anim_t]),
-                        "buy_animal_frac": torch.tensor([a_anim_f]),
-                        "weed_penalty": torch.tensor([a_weed]),
-                        "maint_water_hour": torch.tensor([a_maint]),
-                        "panic_drop_hour": torch.tensor([a_panic]),
-                        "seed_threshold_mult": torch.tensor([a_seed_m]),
-                        "land_unlock_buffer": torch.tensor([a_land_b]),
-                    }
-                else:
-                    action_dict, _, _ = self.actor_net.get_action(feat_tensor, deterministic=False)
+                # Epsilon-greedy removed: rely on the network's own stochastic sampling
+                action_dict, _, _ = self.actor_net.get_action(feat_tensor, deterministic=False)
 
             # Build plan dict from action_dict
             plan = {}
@@ -248,7 +209,6 @@ def train_actor_network(
                 snapshot_agent = StrategicTrainingAgent(
                     actor_net_torch=snapshot_model,
                     player_id=1,
-                    epsilon=0.0
                 )
                 pool.add_snapshot(snapshot_agent, label=f"ep{ep_num}")
         if verbose:
@@ -257,19 +217,13 @@ def train_actor_network(
     data_features = []
     data_actions = []
     data_targets = []
-    max_buffer = 50000
-
     total_games = 0
     running_loss = 0.0
     loss_count = 0
 
-    epsilon_start = 0.2
-    epsilon_end = 0.01
-
     t_start = time.time()
 
     for episode in range(start_episode, num_episodes):
-        epsilon = epsilon_start + (epsilon_end - epsilon_start) * (episode / max(1, num_episodes - 1))
         seed = random.randint(0, 100000)
 
         model.eval()
@@ -277,7 +231,6 @@ def train_actor_network(
         agent0 = StrategicTrainingAgent(
             actor_net_torch=model,
             player_id=0,
-            epsilon=epsilon,
         )
 
         opp_agent, opp_label = pool.sample()
@@ -313,17 +266,13 @@ def train_actor_network(
             data_actions.append(act)
             data_targets.append(money_delta)
 
-        if len(data_features) > max_buffer:
-            data_features = data_features[-max_buffer:]
-            data_actions = data_actions[-max_buffer:]
-            data_targets = data_targets[-max_buffer:]
-
         total_games += 1
 
-        if len(data_features) >= batch_size:
+        # Train every 10 episodes on a fresh on-policy batch, then clear it
+        if total_games > 0 and total_games % 10 == 0:
             model.train()
 
-            num_updates = max(1, len(agent0.recorded_transitions) // (batch_size // 4))
+            num_updates = max(1, len(data_features) // batch_size)
             for _ in range(num_updates):
                 indices = random.sample(range(len(data_features)), batch_size)
                 
@@ -352,17 +301,17 @@ def train_actor_network(
                 # Compute log probs and entropies
                 from torch.distributions import Categorical, Bernoulli, Normal
                 dist_land = Bernoulli(torch.sigmoid(logits[..., 0]))
-                dist_hire = Categorical(logits=logits[..., 1:7])
-                dist_sell = Bernoulli(torch.sigmoid(logits[..., 7:16]))
-                dist_seed_c = Categorical(logits=logits[..., 16:21])
-                dist_seed_f = Normal(torch.sigmoid(logits[..., 21]), 0.2)
-                dist_anim_t = Categorical(logits=logits[..., 22:25])
-                dist_anim_f = Normal(torch.sigmoid(logits[..., 25]), 0.2)
-                dist_weed = Normal(torch.sigmoid(logits[..., 26]) * 10.0, 1.0)
-                dist_maint = Normal(torch.sigmoid(logits[..., 27]) * 23.0, 2.0)
-                dist_panic = Normal(torch.sigmoid(logits[..., 28]) * 23.0, 2.0)
-                dist_seed_m = Normal(torch.sigmoid(logits[..., 29]) * 5.0, 0.5)
-                dist_land_b = Normal(torch.sigmoid(logits[..., 30]) * 2000.0, 200.0)
+                dist_hire = Categorical(logits=logits[..., 1:14])
+                dist_sell = Bernoulli(torch.sigmoid(logits[..., 14:23]))
+                dist_seed_c = Categorical(logits=logits[..., 23:28])
+                dist_seed_f = Normal(torch.sigmoid(logits[..., 28]), 0.2)
+                dist_anim_t = Categorical(logits=logits[..., 29:32])
+                dist_anim_f = Normal(torch.sigmoid(logits[..., 32]), 0.2)
+                dist_weed = Normal(torch.sigmoid(logits[..., 33]) * 10.0, 1.0)
+                dist_maint = Normal(torch.sigmoid(logits[..., 34]) * 23.0, 2.0)
+                dist_panic = Normal(torch.sigmoid(logits[..., 35]) * 23.0, 2.0)
+                dist_seed_m = Normal(torch.sigmoid(logits[..., 36]) * 5.0, 0.5)
+                dist_land_b = Normal(torch.sigmoid(logits[..., 37]) * 2000.0, 200.0)
 
                 lp_land = dist_land.log_prob(a_land)
                 lp_hire = dist_hire.log_prob(a_hire)
@@ -378,6 +327,12 @@ def train_actor_network(
                 lp_land_b = dist_land_b.log_prob(a_land_b)
                 
                 total_log_prob = lp_land + lp_hire + lp_sell + lp_seed_c + lp_seed_f + lp_anim_t + lp_anim_f + lp_weed + lp_maint + lp_panic + lp_seed_m + lp_land_b
+                
+                # Clamp to prevent individual outlier samples from dominating
+                # the loss. Without this, summing 12 sub-distribution log-probs
+                # (esp. Normal dists far from mean) produces values in -100..-500,
+                # causing loss swings of ±130k that overwhelm critic/entropy terms.
+                total_log_prob = total_log_prob.clamp(-20.0, 2.0)
                 
                 total_entropy = dist_land.entropy() + dist_hire.entropy() + dist_sell.entropy().sum(dim=-1) + \
                                 dist_seed_c.entropy() + dist_seed_f.entropy() + dist_anim_t.entropy() + \
@@ -410,6 +365,11 @@ def train_actor_network(
                 running_loss += loss.item()
                 loss_count += 1
 
+            # CRITICAL FIX: Clear the on-policy buffer after training!
+            data_features.clear()
+            data_actions.clear()
+            data_targets.clear()
+
         if verbose and (episode + 1) % 10 == 0:
             avg_loss = running_loss / max(1, loss_count) if loss_count > 0 else 0
             elapsed = time.time() - t_start
@@ -419,7 +379,6 @@ def train_actor_network(
                 f"loss={avg_loss:.2f} | "
                 f"delta={money_delta:+.0f} | "
                 f"vs={opp_label} | "
-                f"eps={epsilon:.2f} | "
                 f"buf={len(data_features)} | "
                 f"{eps_per_sec:.1f} ep/s"
             )
@@ -432,7 +391,6 @@ def train_actor_network(
                 "episode": episode + 1,
                 "loss": avg_loss,
                 "money_delta": float(money_delta),
-                "epsilon": epsilon,
                 "buffer_size": len(data_features),
                 "eps_per_sec": eps_per_sec,
                 "opponent": opp_label
@@ -459,7 +417,6 @@ def train_actor_network(
             snapshot_agent = StrategicTrainingAgent(
                 actor_net_torch=snapshot_model,
                 player_id=1,
-                epsilon=0.0
             )
             pool.add_snapshot(snapshot_agent, label=f"ep{episode + 1}")
             if verbose:

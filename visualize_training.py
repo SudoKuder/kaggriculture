@@ -127,7 +127,7 @@ def plot_metrics(metrics, output_file=None):
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="Visualize training logs")
-    parser.add_argument("--log", default="strategy_checkpoints/logs/training_metrics.jsonl", 
+    parser.add_argument("--log", default="training_metrics.jsonl", 
                         help="Path to the JSONL log file")
     parser.add_argument("--output", "-o", default="training_graphs.png", 
                         help="Output image file (e.g., graph.png)")
