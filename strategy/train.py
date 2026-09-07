@@ -234,6 +234,16 @@ def train_actor_network(
     running_actor_loss = 0.0
     running_critic_loss = 0.0
     running_entropy_loss = 0.0
+    
+    # Tracking for new diagnostics
+    running_lp_mean = 0.0
+    running_lp_std = 0.0
+    running_ent_land = 0.0
+    running_ent_hire = 0.0
+    running_ent_sell = 0.0
+    running_ent_seed_c = 0.0
+    running_ent_anim_t = 0.0
+    
     loss_count = 0
     last_buffer_size = 0
 
@@ -320,14 +330,14 @@ def train_actor_network(
                 dist_hire = Categorical(logits=logits[..., 1:14])
                 dist_sell = Bernoulli(torch.sigmoid(logits[..., 14:23]))
                 dist_seed_c = Categorical(logits=logits[..., 23:28])
-                dist_seed_f = Normal(torch.sigmoid(logits[..., 28]), 0.2)
+                dist_seed_f = Normal(torch.sigmoid(logits[..., 28]), torch.nn.functional.softplus(logits[..., 38]).clamp(0.01, 1.0))
                 dist_anim_t = Categorical(logits=logits[..., 29:32])
-                dist_anim_f = Normal(torch.sigmoid(logits[..., 32]), 0.2)
-                dist_weed = Normal(torch.sigmoid(logits[..., 33]) * 10.0, 1.0)
-                dist_maint = Normal(torch.sigmoid(logits[..., 34]) * 23.0, 2.0)
-                dist_panic = Normal(torch.sigmoid(logits[..., 35]) * 23.0, 2.0)
-                dist_seed_m = Normal(torch.sigmoid(logits[..., 36]) * 5.0, 0.5)
-                dist_land_b = Normal(torch.sigmoid(logits[..., 37]) * 2000.0, 200.0)
+                dist_anim_f = Normal(torch.sigmoid(logits[..., 32]), torch.nn.functional.softplus(logits[..., 39]).clamp(0.01, 1.0))
+                dist_weed = Normal(torch.sigmoid(logits[..., 33]) * 10.0, torch.nn.functional.softplus(logits[..., 40]).clamp(0.01, 5.0))
+                dist_maint = Normal(torch.sigmoid(logits[..., 34]) * 23.0, torch.nn.functional.softplus(logits[..., 41]).clamp(0.01, 10.0))
+                dist_panic = Normal(torch.sigmoid(logits[..., 35]) * 23.0, torch.nn.functional.softplus(logits[..., 42]).clamp(0.01, 10.0))
+                dist_seed_m = Normal(torch.sigmoid(logits[..., 36]) * 5.0, torch.nn.functional.softplus(logits[..., 43]).clamp(0.01, 2.5))
+                dist_land_b = Normal(torch.sigmoid(logits[..., 37]) * 2000.0, torch.nn.functional.softplus(logits[..., 44]).clamp(1.0, 1000.0))
 
                 lp_land = dist_land.log_prob(a_land)
                 lp_hire = dist_hire.log_prob(a_hire)
@@ -382,6 +392,15 @@ def train_actor_network(
                 running_actor_loss += actor_loss.item()
                 running_critic_loss += critic_loss.item()
                 running_entropy_loss += entropy_loss.item()
+                
+                running_lp_mean += total_log_prob.mean().item()
+                running_lp_std += total_log_prob.std().item() if len(total_log_prob) > 1 else 0.0
+                running_ent_land += dist_land.entropy().mean().item()
+                running_ent_hire += dist_hire.entropy().mean().item()
+                running_ent_sell += dist_sell.entropy().sum(dim=-1).mean().item()
+                running_ent_seed_c += dist_seed_c.entropy().mean().item()
+                running_ent_anim_t += dist_anim_t.entropy().mean().item()
+                
                 loss_count += 1
 
             # CRITICAL FIX: Clear the on-policy buffer after training!
@@ -396,6 +415,14 @@ def train_actor_network(
             avg_critic = running_critic_loss / max(1, loss_count) if loss_count > 0 else 0
             avg_entropy = running_entropy_loss / max(1, loss_count) if loss_count > 0 else 0
             
+            avg_lp_mean = running_lp_mean / max(1, loss_count) if loss_count > 0 else 0
+            avg_lp_std = running_lp_std / max(1, loss_count) if loss_count > 0 else 0
+            avg_ent_land = running_ent_land / max(1, loss_count) if loss_count > 0 else 0
+            avg_ent_hire = running_ent_hire / max(1, loss_count) if loss_count > 0 else 0
+            avg_ent_sell = running_ent_sell / max(1, loss_count) if loss_count > 0 else 0
+            avg_ent_seed_c = running_ent_seed_c / max(1, loss_count) if loss_count > 0 else 0
+            avg_ent_anim_t = running_ent_anim_t / max(1, loss_count) if loss_count > 0 else 0
+            
             elapsed = time.time() - t_start
             eps_per_sec = (episode + 1) / elapsed
             print(
@@ -405,6 +432,11 @@ def train_actor_network(
                 f"vs={opp_label} | "
                 f"buf={last_buffer_size} | "
                 f"{eps_per_sec:.1f} ep/s"
+            )
+            print(
+                f"    Diag: lp_mean={avg_lp_mean:.2f}, lp_std={avg_lp_std:.2f} | "
+                f"Discrete ents: land={avg_ent_land:.2f}, hire={avg_ent_hire:.2f}, "
+                f"sell={avg_ent_sell:.2f}, seed_c={avg_ent_seed_c:.2f}, anim_t={avg_ent_anim_t:.2f}"
             )
             # Log metrics to JSONL for visualize_training.py
             log_dir = os.path.join(output_dir, "logs")
@@ -431,6 +463,13 @@ def train_actor_network(
             running_actor_loss = 0.0
             running_critic_loss = 0.0
             running_entropy_loss = 0.0
+            running_lp_mean = 0.0
+            running_lp_std = 0.0
+            running_ent_land = 0.0
+            running_ent_hire = 0.0
+            running_ent_sell = 0.0
+            running_ent_seed_c = 0.0
+            running_ent_anim_t = 0.0
             loss_count = 0
             gc.collect()
 

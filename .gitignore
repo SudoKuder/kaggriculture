@@ -8,3 +8,6 @@ __pycache__/
 *.json
 *.html
 *.jsonl
+*.md
+*.png
+*pngz

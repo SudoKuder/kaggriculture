@@ -18,7 +18,7 @@ except ImportError:
 
 # 64 state features (without the 14-dim plan encoding)
 FEATURE_DIM = 64
-ACTION_DIM = 38
+ACTION_DIM = 45
 
 # Output dimension indices:
 # [0] buy_land logit (sigmoid)
@@ -33,6 +33,13 @@ ACTION_DIM = 38
 # [35] panic_drop_hour logit (sigmoid -> scale [0, 23])
 # [36] seed_threshold_mult logit (sigmoid -> scale [0, 5])
 # [37] land_unlock_buffer logit (sigmoid -> scale [0, 2000])
+# [38] buy_seed_frac log_std
+# [39] buy_animal_frac log_std
+# [40] weed_penalty log_std
+# [41] maint_water_hour log_std
+# [42] panic_drop_hour log_std
+# [43] seed_threshold_mult log_std
+# [44] land_unlock_buffer log_std
 
 # ---------------------------------------------------------------------------
 # PyTorch model (training only)
@@ -83,10 +90,10 @@ if HAS_TORCH:
             a_seed_c = torch.argmax(logits[..., 23:28], dim=-1) if deterministic else dist_seed_c.sample()
             lp_seed_c = dist_seed_c.log_prob(a_seed_c)
             
-            # 5. buy_seed_frac (Normal with fixed std or just deterministic sigmoid + noise)
+            # 5. buy_seed_frac (Normal)
             mean_seed_f = torch.sigmoid(logits[..., 28])
-            std = 0.2
-            dist_seed_f = Normal(mean_seed_f, std)
+            std_seed_f = torch.nn.functional.softplus(logits[..., 38]).clamp(0.01, 1.0)
+            dist_seed_f = Normal(mean_seed_f, std_seed_f)
             if deterministic:
                 a_seed_f = mean_seed_f
             else:
@@ -100,7 +107,8 @@ if HAS_TORCH:
             
             # 7. buy_animal_frac (Normal)
             mean_anim_f = torch.sigmoid(logits[..., 32])
-            dist_anim_f = Normal(mean_anim_f, std)
+            std_anim_f = torch.nn.functional.softplus(logits[..., 39]).clamp(0.01, 1.0)
+            dist_anim_f = Normal(mean_anim_f, std_anim_f)
             if deterministic:
                 a_anim_f = mean_anim_f
             else:
@@ -109,27 +117,32 @@ if HAS_TORCH:
             
             # 8. Tactical parameters (Normal distributions)
             mean_weed = torch.sigmoid(logits[..., 33]) * 10.0
-            dist_weed = Normal(mean_weed, 1.0)
+            std_weed = torch.nn.functional.softplus(logits[..., 40]).clamp(0.01, 5.0)
+            dist_weed = Normal(mean_weed, std_weed)
             a_weed = mean_weed if deterministic else dist_weed.sample().clamp(0.0, 10.0)
             lp_weed = dist_weed.log_prob(a_weed)
             
             mean_maint = torch.sigmoid(logits[..., 34]) * 23.0
-            dist_maint = Normal(mean_maint, 2.0)
+            std_maint = torch.nn.functional.softplus(logits[..., 41]).clamp(0.01, 10.0)
+            dist_maint = Normal(mean_maint, std_maint)
             a_maint = mean_maint if deterministic else dist_maint.sample().clamp(0.0, 23.0)
             lp_maint = dist_maint.log_prob(a_maint)
             
             mean_panic = torch.sigmoid(logits[..., 35]) * 23.0
-            dist_panic = Normal(mean_panic, 2.0)
+            std_panic = torch.nn.functional.softplus(logits[..., 42]).clamp(0.01, 10.0)
+            dist_panic = Normal(mean_panic, std_panic)
             a_panic = mean_panic if deterministic else dist_panic.sample().clamp(0.0, 23.0)
             lp_panic = dist_panic.log_prob(a_panic)
             
             mean_seed_m = torch.sigmoid(logits[..., 36]) * 5.0
-            dist_seed_m = Normal(mean_seed_m, 0.5)
+            std_seed_m = torch.nn.functional.softplus(logits[..., 43]).clamp(0.01, 2.5)
+            dist_seed_m = Normal(mean_seed_m, std_seed_m)
             a_seed_m = mean_seed_m if deterministic else dist_seed_m.sample().clamp(0.0, 5.0)
             lp_seed_m = dist_seed_m.log_prob(a_seed_m)
             
             mean_land_b = torch.sigmoid(logits[..., 37]) * 2000.0
-            dist_land_b = Normal(mean_land_b, 200.0)
+            std_land_b = torch.nn.functional.softplus(logits[..., 44]).clamp(1.0, 1000.0)
+            dist_land_b = Normal(mean_land_b, std_land_b)
             a_land_b = mean_land_b if deterministic else dist_land_b.sample().clamp(0.0, 2000.0)
             lp_land_b = dist_land_b.log_prob(a_land_b)
             
@@ -169,8 +182,18 @@ if HAS_TORCH:
                 layer_idx = i // 2
                 W, b, _ = layers[layer_idx]
                 with torch.no_grad():
-                    params[i].copy_(torch.from_numpy(W.T))
-                    params[i + 1].copy_(torch.from_numpy(b))
+                    w_tensor = torch.from_numpy(W.T)
+                    b_tensor = torch.from_numpy(b)
+                    
+                    # Handle shape mismatches (e.g., resuming 38-dim checkpoint into 45-dim model)
+                    out_old, in_old = w_tensor.shape
+                    out_new, in_new = params[i].shape
+                    
+                    min_out = min(out_old, out_new)
+                    min_in = min(in_old, in_new)
+                    
+                    params[i][:min_out, :min_in].copy_(w_tensor[:min_out, :min_in])
+                    params[i + 1][:min_out].copy_(b_tensor[:min_out])
 
 # ---------------------------------------------------------------------------
 # Numpy-only inference (submission)
