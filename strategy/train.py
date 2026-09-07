@@ -44,9 +44,10 @@ class StrategicTrainingAgent:
     training episodes. Records state features and actions.
     """
 
-    def __init__(self, actor_net_torch, player_id=0):
+    def __init__(self, actor_net_torch, player_id=0, deterministic=False):
         self.actor_net = actor_net_torch
         self.player_id = player_id
+        self.deterministic = deterministic
         self.recorded_transitions = []  # list of (features, action_dict)
         self.current_plan = None
 
@@ -74,7 +75,7 @@ class StrategicTrainingAgent:
                 feat_tensor = torch.tensor(features, dtype=torch.float32).unsqueeze(0).to(device)
                 
                 # Epsilon-greedy removed: rely on the network's own stochastic sampling
-                action_dict, _, _ = self.actor_net.get_action(feat_tensor, deterministic=False)
+                action_dict, _, _ = self.actor_net.get_action(feat_tensor, deterministic=self.deterministic)
 
             # Build plan dict from action_dict
             plan = {}
@@ -142,6 +143,8 @@ def train_actor_network(
     batch_size=32,
     lr=1e-3,
     checkpoint_interval=100,
+    eval_interval=500,
+    eval_episodes_per_opponent=50,
     output_dir="strategy_checkpoints",
     verbose=True,
 ):
@@ -198,6 +201,15 @@ def train_actor_network(
         noise_variants=2,
     )
     
+    # We create a static eval pool with just the fixed opponents for pure evaluation
+    eval_pool = OpponentPool(
+        include_starter=True,
+        include_heuristic=True,
+        include_passive=True,
+        noise_variants=2,
+    )
+    eval_opponents = eval_pool.all_agents()
+    
     # Load past checkpoints into the pool
     if checkpoints:
         for ckpt in checkpoints:
@@ -219,7 +231,11 @@ def train_actor_network(
     data_targets = []
     total_games = 0
     running_loss = 0.0
+    running_actor_loss = 0.0
+    running_critic_loss = 0.0
+    running_entropy_loss = 0.0
     loss_count = 0
+    last_buffer_size = 0
 
     t_start = time.time()
 
@@ -363,23 +379,31 @@ def train_actor_network(
                 optimizer.step()
     
                 running_loss += loss.item()
+                running_actor_loss += actor_loss.item()
+                running_critic_loss += critic_loss.item()
+                running_entropy_loss += entropy_loss.item()
                 loss_count += 1
 
             # CRITICAL FIX: Clear the on-policy buffer after training!
+            last_buffer_size = len(data_features)
             data_features.clear()
             data_actions.clear()
             data_targets.clear()
 
         if verbose and (episode + 1) % 10 == 0:
             avg_loss = running_loss / max(1, loss_count) if loss_count > 0 else 0
+            avg_actor = running_actor_loss / max(1, loss_count) if loss_count > 0 else 0
+            avg_critic = running_critic_loss / max(1, loss_count) if loss_count > 0 else 0
+            avg_entropy = running_entropy_loss / max(1, loss_count) if loss_count > 0 else 0
+            
             elapsed = time.time() - t_start
             eps_per_sec = (episode + 1) / elapsed
             print(
                 f"  Episode {episode + 1}/{num_episodes} | "
-                f"loss={avg_loss:.2f} | "
+                f"loss={avg_loss:.2f} (a:{avg_actor:.2f} c:{avg_critic:.2f} e:{avg_entropy:.2f}) | "
                 f"delta={money_delta:+.0f} | "
                 f"vs={opp_label} | "
-                f"buf={len(data_features)} | "
+                f"buf={last_buffer_size} | "
                 f"{eps_per_sec:.1f} ep/s"
             )
             # Log metrics to JSONL for visualize_training.py
@@ -390,8 +414,11 @@ def train_actor_network(
             log_entry = {
                 "episode": episode + 1,
                 "loss": avg_loss,
+                "actor_loss": avg_actor,
+                "critic_loss": avg_critic,
+                "entropy_loss": avg_entropy,
                 "money_delta": float(money_delta),
-                "buffer_size": len(data_features),
+                "buffer_size": last_buffer_size,
                 "eps_per_sec": eps_per_sec,
                 "opponent": opp_label
             }
@@ -401,8 +428,69 @@ def train_actor_network(
                 f.write(json.dumps(log_entry) + "\n")
                 
             running_loss = 0.0
+            running_actor_loss = 0.0
+            running_critic_loss = 0.0
+            running_entropy_loss = 0.0
             loss_count = 0
             gc.collect()
+
+        if (episode + 1) % eval_interval == 0:
+            if verbose:
+                print(f"\n--- Running deterministic evaluation at episode {episode + 1} ---")
+            
+            eval_agent0 = StrategicTrainingAgent(actor_net_torch=model, player_id=0, deterministic=True)
+            model.eval()
+            
+            eval_metrics = []
+            for opp_agent, eval_opp_label in eval_opponents:
+                eval_money_deltas = []
+                wins = 0
+                for _ in range(eval_episodes_per_opponent):
+                    eval_seed = random.randint(0, 100000)
+                    try:
+                        eval_env = make("kaggriculture", configuration={"seed": eval_seed})
+                        eval_env.run([eval_agent0, opp_agent])
+                        
+                        e_final_obs = eval_env.state[0]["observation"]
+                        e_m0 = e_final_obs["farms"][0]["money"]
+                        e_m1 = e_final_obs["farms"][1]["money"]
+                        
+                        # Reward shaping for eval
+                        e_priv0 = eval_env.state[0]["observation"].get("private", {})
+                        e_asset_value0 = sum(qty * CROPS[crop]["seed"] for crop, qty in e_priv0.get("seeds", {}).items())
+                        e_priv1 = eval_env.state[1]["observation"].get("private", {})
+                        e_asset_value1 = sum(qty * CROPS[crop]["seed"] for crop, qty in e_priv1.get("seeds", {}).items())
+                        
+                        md = (e_m0 + e_asset_value0) - (e_m1 + e_asset_value1)
+                        eval_money_deltas.append(md)
+                        if md > 0:
+                            wins += 1
+                    except Exception as e:
+                        if verbose:
+                            print(f"  Eval error vs {eval_opp_label}: {e}")
+                            
+                if eval_money_deltas:
+                    mean_md = sum(eval_money_deltas) / len(eval_money_deltas)
+                    win_rate = wins / len(eval_money_deltas)
+                else:
+                    mean_md, win_rate = 0.0, 0.0
+                    
+                eval_metrics.append({
+                    "episode": episode + 1,
+                    "opponent": eval_opp_label,
+                    "mean_money_delta": mean_md,
+                    "win_rate": win_rate
+                })
+                
+                if verbose:
+                    print(f"  Eval vs {eval_opp_label:12s} | win_rate: {win_rate:.2f} | mean_delta: {mean_md:+.1f}")
+                    
+            eval_jsonl_path = os.path.join(output_dir, "logs", "eval_metrics.jsonl")
+            with open(eval_jsonl_path, "a", encoding="utf-8") as f:
+                for entry in eval_metrics:
+                    f.write(json.dumps(entry) + "\n")
+            if verbose:
+                print("----------------------------------------------------------\n")
 
         if (episode + 1) % checkpoint_interval == 0:
             ckpt_path = os.path.join(output_dir, f"actor_net_ep{episode + 1}.npz")
