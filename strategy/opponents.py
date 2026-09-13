@@ -65,53 +65,95 @@ def _make_passive_agent():
 
 
 class OpponentPool:
-    """Manages a pool of opponent agents for training."""
+    """Manages a pool of opponent agents for training.
+
+    Self-play snapshots are capped at ``max_snapshots`` to prevent an
+    ever-growing pool of stale opponents from diluting training signal.
+    When the cap is exceeded, the oldest snapshot is evicted.  Sampling
+    is weighted so that more recent snapshots are selected more often.
+
+    ``fixed_opponent_fraction`` controls what share of ``sample()`` calls
+    draw from the base (non-self-play) agents.  Setting this to 0.7 means
+    70 % of games are played against heuristic / noisy / passive opponents,
+    preventing the reward signal from collapsing to zero when the self-play
+    pool grows large.
+    """
 
     def __init__(self, include_starter=True, include_heuristic=True,
-                 include_passive=True, noise_variants=2):
-        self._agents = []
-        self._labels = []
+                 include_passive=True, noise_variants=2,
+                 max_snapshots=5, fixed_opponent_fraction=0.7):
+        self._base_agents = []
+        self._base_labels = []
+        self._snapshots = []       # list of (agent, label)
+        self._max_snapshots = max_snapshots
+        self._fixed_frac = fixed_opponent_fraction
 
         if include_starter:
-            self._agents.append(_make_starter_agent())
-            self._labels.append("starter")
+            self._base_agents.append(_make_starter_agent())
+            self._base_labels.append("starter")
 
         if include_heuristic:
             heur = _make_heuristic_agent()
-            self._agents.append(heur)
-            self._labels.append("heuristic")
+            self._base_agents.append(heur)
+            self._base_labels.append("heuristic")
 
             # Add noisy variants
             for i in range(noise_variants):
                 rate = 0.1 + 0.1 * i  # 0.1, 0.2, ...
-                self._agents.append(_make_noisy_agent(heur, noise_rate=rate))
-                self._labels.append(f"noisy_{rate:.1f}")
+                self._base_agents.append(_make_noisy_agent(heur, noise_rate=rate))
+                self._base_labels.append(f"noisy_{rate:.1f}")
 
         if include_passive:
-            self._agents.append(_make_passive_agent())
-            self._labels.append("passive")
-
-        # Past agent snapshots are added via add_snapshot()
-        self._snapshots = []
+            self._base_agents.append(_make_passive_agent())
+            self._base_labels.append("passive")
 
     def add_snapshot(self, agent_fn, label="snapshot"):
-        """Add a past agent version as a training opponent."""
-        self._snapshots.append(agent_fn)
-        self._labels.append(label)
-        self._agents.append(agent_fn)
+        """Add a past agent version as a training opponent.
+
+        If adding this snapshot would exceed ``max_snapshots``, the oldest
+        snapshot is evicted first.
+        """
+        self._snapshots.append((agent_fn, label))
+        if len(self._snapshots) > self._max_snapshots:
+            self._snapshots.pop(0)
 
     def sample(self):
         """Sample a random opponent from the pool.
 
+        Fixed (base) agents are sampled with probability
+        ``fixed_opponent_fraction`` (default 0.7).  When snapshots exist and
+        the roll falls into the self-play bucket, more recent snapshots are
+        preferred (linearly increasing weights).
+
         Returns:
             (agent, label): An agent (function or string) and its label.
         """
-        idx = random.randrange(len(self._agents))
-        return self._agents[idx], self._labels[idx]
+        has_snapshots = len(self._snapshots) > 0
+        # Always use fixed opponents when no snapshots yet.
+        # Otherwise respect the configured fraction.
+        use_fixed = (not has_snapshots) or (random.random() < self._fixed_frac)
+        if use_fixed:
+            idx = random.randrange(len(self._base_agents))
+            return self._base_agents[idx], self._base_labels[idx]
+        else:
+            # Weight toward recent snapshots: weight[i] = i + 1
+            n = len(self._snapshots)
+            weights = list(range(1, n + 1))
+            total = sum(weights)
+            r = random.random() * total
+            cumulative = 0
+            for idx, w in enumerate(weights):
+                cumulative += w
+                if r <= cumulative:
+                    return self._snapshots[idx]
+            return self._snapshots[-1]  # fallback
 
     def all_agents(self):
         """Return all (agent, label) pairs."""
-        return list(zip(self._agents, self._labels))
+        pairs = list(zip(self._base_agents, self._base_labels))
+        pairs.extend(self._snapshots)
+        return pairs
 
     def __len__(self):
-        return len(self._agents)
+        return len(self._base_agents) + len(self._snapshots)
+

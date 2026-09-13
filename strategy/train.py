@@ -210,9 +210,14 @@ def train_actor_network(
     )
     eval_opponents = eval_pool.all_agents()
     
-    # Load past checkpoints into the pool
+    # Load ONLY the most recent N checkpoints into the pool to avoid
+    # immediately flooding self-play with stale opponents (which was the
+    # primary cause of the 98% self-play / collapsed reward signal bug).
+    MAX_STARTUP_SNAPSHOTS = 5
     if checkpoints:
-        for ckpt in checkpoints:
+        # Sort newest first, take at most MAX_STARTUP_SNAPSHOTS
+        sorted_ckpts = sorted(checkpoints, key=extract_ep, reverse=True)[:MAX_STARTUP_SNAPSHOTS]
+        for ckpt in sorted_ckpts:
             ep_num = extract_ep(ckpt)
             if ep_num > 0:
                 snapshot_model = ActorNetTorch(input_dim=FEATURE_DIM).to(device)
@@ -224,7 +229,22 @@ def train_actor_network(
                 )
                 pool.add_snapshot(snapshot_agent, label=f"ep{ep_num}")
         if verbose:
-            print(f"Loaded {len(checkpoints)} past checkpoints into OpponentPool (size: {len(pool)})")
+            print(f"Loaded {len(sorted_ckpts)} most-recent checkpoints into OpponentPool (size: {len(pool)})")
+
+    # Entropy coefficients with linear annealing.
+    # Start high enough to force exploration, decay to a small floor so the
+    # policy gradient can dominate once the agent has seen enough diversity.
+    # 0.05 was too high — it drove all discrete heads to maximum entropy
+    # (pure random play, 2% win rate). 0.01 was too low — entropy collapsed
+    # in the first 3k episodes, killing the actor gradient.
+    # Sweet spot: start=0.02, end=0.005, anneal over 30k episodes.
+    ENTROPY_COEFF_DISCRETE_START = 0.02
+    ENTROPY_COEFF_DISCRETE_END   = 0.005
+    ENTROPY_COEFF_CONT_START     = 0.002
+    ENTROPY_COEFF_CONT_END       = 0.0005
+    ENTROPY_ANNEAL_STEPS         = 30_000   # episodes over which to anneal
+    # Discount factor for reward-to-go
+    GAMMA = 0.99
 
     data_features = []
     data_actions = []
@@ -233,16 +253,19 @@ def train_actor_network(
     running_loss = 0.0
     running_actor_loss = 0.0
     running_critic_loss = 0.0
-    running_entropy_loss = 0.0
+    running_entropy_loss_disc = 0.0
+    running_entropy_loss_cont = 0.0
     
     # Tracking for new diagnostics
     running_lp_mean = 0.0
     running_lp_std = 0.0
+    running_clamp_frac = 0.0
     running_ent_land = 0.0
     running_ent_hire = 0.0
     running_ent_sell = 0.0
     running_ent_seed_c = 0.0
     running_ent_anim_t = 0.0
+    running_cont_entropy = 0.0
     
     loss_count = 0
     last_buffer_size = 0
@@ -287,10 +310,15 @@ def train_actor_network(
         
         money_delta = (m0 + asset_value0) - (m1 + asset_value1)
 
-        for feat, act in agent0.recorded_transitions:
+        # Discounted returns: assign each day's decision a discounted
+        # version of the final money_delta so earlier actions get less
+        # credit, reducing variance across long episodes (~29 decisions).
+        n_transitions = len(agent0.recorded_transitions)
+        for step_idx, (feat, act) in enumerate(agent0.recorded_transitions):
+            discount = GAMMA ** (n_transitions - 1 - step_idx)
             data_features.append(feat)
             data_actions.append(act)
-            data_targets.append(money_delta)
+            data_targets.append(money_delta * discount)
 
         total_games += 1
 
@@ -308,7 +336,10 @@ def train_actor_network(
                 ).to(device)
                 
                 # Re-compute log probs for the recorded actions
+                # Use the shared get_distributions() helper so min-std
+                # stays in sync with actor_net.py.
                 _, _, logits = model.get_action(batch_x)
+                discrete_dists, continuous_dists = model.get_distributions(logits)
                 
                 # Collect actual actions taken
                 a_land = torch.tensor(np.array([data_actions[i]["buy_land"] for i in indices])).to(device)
@@ -324,21 +355,21 @@ def train_actor_network(
                 a_seed_m = torch.tensor(np.array([data_actions[i]["seed_threshold_mult"] for i in indices])).to(device)
                 a_land_b = torch.tensor(np.array([data_actions[i]["land_unlock_buffer"] for i in indices])).to(device)
                 
-                # Compute log probs and entropies
-                from torch.distributions import Categorical, Bernoulli, Normal
-                dist_land = Bernoulli(torch.sigmoid(logits[..., 0]))
-                dist_hire = Categorical(logits=logits[..., 1:14])
-                dist_sell = Bernoulli(torch.sigmoid(logits[..., 14:23]))
-                dist_seed_c = Categorical(logits=logits[..., 23:28])
-                dist_seed_f = Normal(torch.sigmoid(logits[..., 28]), torch.nn.functional.softplus(logits[..., 38]).clamp(0.01, 1.0))
-                dist_anim_t = Categorical(logits=logits[..., 29:32])
-                dist_anim_f = Normal(torch.sigmoid(logits[..., 32]), torch.nn.functional.softplus(logits[..., 39]).clamp(0.01, 1.0))
-                dist_weed = Normal(torch.sigmoid(logits[..., 33]) * 10.0, torch.nn.functional.softplus(logits[..., 40]).clamp(0.01, 5.0))
-                dist_maint = Normal(torch.sigmoid(logits[..., 34]) * 23.0, torch.nn.functional.softplus(logits[..., 41]).clamp(0.01, 10.0))
-                dist_panic = Normal(torch.sigmoid(logits[..., 35]) * 23.0, torch.nn.functional.softplus(logits[..., 42]).clamp(0.01, 10.0))
-                dist_seed_m = Normal(torch.sigmoid(logits[..., 36]) * 5.0, torch.nn.functional.softplus(logits[..., 43]).clamp(0.01, 2.5))
-                dist_land_b = Normal(torch.sigmoid(logits[..., 37]) * 2000.0, torch.nn.functional.softplus(logits[..., 44]).clamp(1.0, 1000.0))
+                # Unpack distributions from get_distributions()
+                dist_land   = discrete_dists[0][1]
+                dist_hire   = discrete_dists[1][1]
+                dist_sell   = discrete_dists[2][1]
+                dist_seed_c = discrete_dists[3][1]
+                dist_anim_t = discrete_dists[4][1]
+                dist_seed_f = continuous_dists[0][1]
+                dist_anim_f = continuous_dists[1][1]
+                dist_weed   = continuous_dists[2][1]
+                dist_maint  = continuous_dists[3][1]
+                dist_panic  = continuous_dists[4][1]
+                dist_seed_m = continuous_dists[5][1]
+                dist_land_b = continuous_dists[6][1]
 
+                # Compute log probs per action head
                 lp_land = dist_land.log_prob(a_land)
                 lp_hire = dist_hire.log_prob(a_hire)
                 lp_sell = dist_sell.log_prob(a_sell).sum(dim=-1)
@@ -352,23 +383,50 @@ def train_actor_network(
                 lp_seed_m = dist_seed_m.log_prob(a_seed_m)
                 lp_land_b = dist_land_b.log_prob(a_land_b)
                 
-                total_log_prob = lp_land + lp_hire + lp_sell + lp_seed_c + lp_seed_f + lp_anim_t + lp_anim_f + lp_weed + lp_maint + lp_panic + lp_seed_m + lp_land_b
+                total_log_prob = (lp_land + lp_hire + lp_sell + lp_seed_c +
+                                  lp_seed_f + lp_anim_t + lp_anim_f +
+                                  lp_weed + lp_maint + lp_panic +
+                                  lp_seed_m + lp_land_b)
                 
-                # Clamp to prevent individual outlier samples from dominating
-                # the loss. Without this, summing 12 sub-distribution log-probs
-                # (esp. Normal dists far from mean) produces values in -100..-500,
-                # causing loss swings of ±130k that overwhelm critic/entropy terms.
-                total_log_prob = total_log_prob.clamp(-20.0, 2.0)
+                # NOTE: We no longer clamp total_log_prob itself.  The
+                # underlying cause of extreme magnitudes (min_std = 0.01)
+                # has been fixed by raising MIN_STD to 0.05 in
+                # ActorNetTorch.  Instead we clip the per-sample
+                # advantage-weighted product at the *loss* level so
+                # gradient flow is never zeroed out.
+
+
+                # --- Separate entropy for discrete vs continuous heads ---
+                discrete_entropy = (
+                    dist_land.entropy() +
+                    dist_hire.entropy() +
+                    dist_sell.entropy().sum(dim=-1) +
+                    dist_seed_c.entropy() +
+                    dist_anim_t.entropy()
+                )
+                continuous_entropy = (
+                    dist_seed_f.entropy() +
+                    dist_anim_f.entropy() +
+                    dist_weed.entropy() +
+                    dist_maint.entropy() +
+                    dist_panic.entropy() +
+                    dist_seed_m.entropy() +
+                    dist_land_b.entropy()
+                )
                 
-                total_entropy = dist_land.entropy() + dist_hire.entropy() + dist_sell.entropy().sum(dim=-1) + \
-                                dist_seed_c.entropy() + dist_seed_f.entropy() + dist_anim_t.entropy() + \
-                                dist_anim_f.entropy() + dist_weed.entropy() + dist_maint.entropy() + \
-                                dist_panic.entropy() + dist_seed_m.entropy() + dist_land_b.entropy()
-                
-                batch_r = torch.tensor(
+                batch_r_raw = torch.tensor(
                     np.array([_log_money(data_targets[i]) for i in indices]),
                     dtype=torch.float32,
                 ).to(device)
+
+                # Normalize the raw returns themselves before critic regression.
+                # When all returns are near-zero (self-play cancellation), the
+                # unscaled targets give the critic nothing to learn from, which
+                # collapses advantages → kills actor gradients.
+                if batch_r_raw.std() > 1e-6:
+                    batch_r = (batch_r_raw - batch_r_raw.mean()) / (batch_r_raw.std() + 1e-8)
+                else:
+                    batch_r = batch_r_raw  # all same value – critic can't help anyway
                 
                 batch_v = critic(batch_x)
                 advantages = batch_r - batch_v.detach()
@@ -376,11 +434,30 @@ def train_actor_network(
                 if len(advantages) > 1:
                     advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
                 
-                actor_loss = -(total_log_prob * advantages).mean()
-                critic_loss = nn.functional.mse_loss(batch_v, batch_r)
-                entropy_loss = -0.01 * total_entropy.mean()  # 0.01 is the entropy coefficient
+                # DIAGNOSTIC: fraction of samples hitting the loss-level clamp.
+                # Unlike the old log-prob clamp (which killed 100% of gradients),
+                # clipping the product at [-20, 20] acts as gradient clipping
+                # and typically only affects ~40% of samples.
+                with torch.no_grad():
+                    product = total_log_prob * advantages
+                    would_clamp = ((product < -20.0) | (product > 20.0)).float()
+                    clamp_frac = would_clamp.mean().item()
                 
-                loss = actor_loss + 0.5 * critic_loss + entropy_loss
+                # Clip at the loss level: cap the per-sample product
+                # (log_prob * advantage) to [-20, 20] so no single sample
+                # can produce an outsized gradient, but gradient still
+                # flows for all samples (unlike the old log-prob clamp).
+                # Linearly anneal entropy coefficient from start → end
+                anneal_frac = min(1.0, (episode - start_episode) / max(1, ENTROPY_ANNEAL_STEPS))
+                ec_disc = ENTROPY_COEFF_DISCRETE_START + anneal_frac * (ENTROPY_COEFF_DISCRETE_END - ENTROPY_COEFF_DISCRETE_START)
+                ec_cont = ENTROPY_COEFF_CONT_START     + anneal_frac * (ENTROPY_COEFF_CONT_END     - ENTROPY_COEFF_CONT_START)
+
+                actor_loss = -(total_log_prob * advantages).clamp(-20.0, 20.0).mean()
+                critic_loss = nn.functional.mse_loss(batch_v, batch_r)
+                entropy_loss_disc = -ec_disc * discrete_entropy.mean()
+                entropy_loss_cont = -ec_cont * continuous_entropy.mean()
+                
+                loss = actor_loss + 0.5 * critic_loss + entropy_loss_disc + entropy_loss_cont
     
                 optimizer.zero_grad()
                 loss.backward()
@@ -391,15 +468,18 @@ def train_actor_network(
                 running_loss += loss.item()
                 running_actor_loss += actor_loss.item()
                 running_critic_loss += critic_loss.item()
-                running_entropy_loss += entropy_loss.item()
+                running_entropy_loss_disc += entropy_loss_disc.item()
+                running_entropy_loss_cont += entropy_loss_cont.item()
                 
                 running_lp_mean += total_log_prob.mean().item()
                 running_lp_std += total_log_prob.std().item() if len(total_log_prob) > 1 else 0.0
+                running_clamp_frac += clamp_frac
                 running_ent_land += dist_land.entropy().mean().item()
                 running_ent_hire += dist_hire.entropy().mean().item()
                 running_ent_sell += dist_sell.entropy().sum(dim=-1).mean().item()
                 running_ent_seed_c += dist_seed_c.entropy().mean().item()
                 running_ent_anim_t += dist_anim_t.entropy().mean().item()
+                running_cont_entropy += continuous_entropy.mean().item()
                 
                 loss_count += 1
 
@@ -410,33 +490,41 @@ def train_actor_network(
             data_targets.clear()
 
         if verbose and (episode + 1) % 10 == 0:
-            avg_loss = running_loss / max(1, loss_count) if loss_count > 0 else 0
-            avg_actor = running_actor_loss / max(1, loss_count) if loss_count > 0 else 0
-            avg_critic = running_critic_loss / max(1, loss_count) if loss_count > 0 else 0
-            avg_entropy = running_entropy_loss / max(1, loss_count) if loss_count > 0 else 0
+            lc = max(1, loss_count)
+            avg_loss = running_loss / lc
+            avg_actor = running_actor_loss / lc
+            avg_critic = running_critic_loss / lc
+            avg_ent_disc = running_entropy_loss_disc / lc
+            avg_ent_cont = running_entropy_loss_cont / lc
+            avg_entropy = avg_ent_disc + avg_ent_cont
             
-            avg_lp_mean = running_lp_mean / max(1, loss_count) if loss_count > 0 else 0
-            avg_lp_std = running_lp_std / max(1, loss_count) if loss_count > 0 else 0
-            avg_ent_land = running_ent_land / max(1, loss_count) if loss_count > 0 else 0
-            avg_ent_hire = running_ent_hire / max(1, loss_count) if loss_count > 0 else 0
-            avg_ent_sell = running_ent_sell / max(1, loss_count) if loss_count > 0 else 0
-            avg_ent_seed_c = running_ent_seed_c / max(1, loss_count) if loss_count > 0 else 0
-            avg_ent_anim_t = running_ent_anim_t / max(1, loss_count) if loss_count > 0 else 0
+            avg_lp_mean = running_lp_mean / lc
+            avg_lp_std = running_lp_std / lc
+            avg_clamp_frac = running_clamp_frac / lc
+            avg_ent_land = running_ent_land / lc
+            avg_ent_hire = running_ent_hire / lc
+            avg_ent_sell = running_ent_sell / lc
+            avg_ent_seed_c = running_ent_seed_c / lc
+            avg_ent_anim_t = running_ent_anim_t / lc
+            avg_cont_entropy = running_cont_entropy / lc
             
             elapsed = time.time() - t_start
             eps_per_sec = (episode + 1) / elapsed
             print(
                 f"  Episode {episode + 1}/{num_episodes} | "
-                f"loss={avg_loss:.2f} (a:{avg_actor:.2f} c:{avg_critic:.2f} e:{avg_entropy:.2f}) | "
+                f"loss={avg_loss:.2f} (a:{avg_actor:.2f} c:{avg_critic:.2f} "
+                f"e_d:{avg_ent_disc:.4f} e_c:{avg_ent_cont:.4f}) | "
                 f"delta={money_delta:+.0f} | "
                 f"vs={opp_label} | "
                 f"buf={last_buffer_size} | "
                 f"{eps_per_sec:.1f} ep/s"
             )
             print(
-                f"    Diag: lp_mean={avg_lp_mean:.2f}, lp_std={avg_lp_std:.2f} | "
+                f"    Diag: lp_mean={avg_lp_mean:.2f}, lp_std={avg_lp_std:.2f}, "
+                f"clamp_frac={avg_clamp_frac:.3f} | "
                 f"Discrete ents: land={avg_ent_land:.2f}, hire={avg_ent_hire:.2f}, "
-                f"sell={avg_ent_sell:.2f}, seed_c={avg_ent_seed_c:.2f}, anim_t={avg_ent_anim_t:.2f}"
+                f"sell={avg_ent_sell:.2f}, seed_c={avg_ent_seed_c:.2f}, anim_t={avg_ent_anim_t:.2f} | "
+                f"Cont ent={avg_cont_entropy:.2f}"
             )
             # Log metrics to JSONL for visualize_training.py
             log_dir = os.path.join(output_dir, "logs")
@@ -448,11 +536,18 @@ def train_actor_network(
                 "loss": avg_loss,
                 "actor_loss": avg_actor,
                 "critic_loss": avg_critic,
+                "entropy_loss_discrete": avg_ent_disc,
+                "entropy_loss_continuous": avg_ent_cont,
                 "entropy_loss": avg_entropy,
                 "money_delta": float(money_delta),
                 "buffer_size": last_buffer_size,
                 "eps_per_sec": eps_per_sec,
-                "opponent": opp_label
+                "opponent": opp_label,
+                "lp_mean": avg_lp_mean,
+                "lp_std": avg_lp_std,
+                "clamp_frac": avg_clamp_frac,
+                "discrete_entropy": avg_ent_land + avg_ent_hire + avg_ent_sell + avg_ent_seed_c + avg_ent_anim_t,
+                "continuous_entropy": avg_cont_entropy,
             }
             
             import json
@@ -462,14 +557,17 @@ def train_actor_network(
             running_loss = 0.0
             running_actor_loss = 0.0
             running_critic_loss = 0.0
-            running_entropy_loss = 0.0
+            running_entropy_loss_disc = 0.0
+            running_entropy_loss_cont = 0.0
             running_lp_mean = 0.0
             running_lp_std = 0.0
+            running_clamp_frac = 0.0
             running_ent_land = 0.0
             running_ent_hire = 0.0
             running_ent_sell = 0.0
             running_ent_seed_c = 0.0
             running_ent_anim_t = 0.0
+            running_cont_entropy = 0.0
             loss_count = 0
             gc.collect()
 

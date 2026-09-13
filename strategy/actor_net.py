@@ -47,7 +47,21 @@ ACTION_DIM = 45
 
 if HAS_TORCH:
     class ActorNetTorch(nn.Module):
-        """64 → 64 → 32 → 38 MLP with ReLU."""
+        """64 → 64 → 32 → 45 MLP with ReLU."""
+
+        # Per-head minimum stds for continuous action heads, set to ~5-10%
+        # of each head's range.  A single MIN_STD doesn't work because
+        # heads span vastly different scales (e.g. buy_seed_frac in [0,1]
+        # vs maint_water_hour in [0,23] vs land_unlock_buffer in [0,2000]).
+        # With the original 0.01 (or even a uniform 0.05), wide-range heads
+        # produce extreme log-probs that collapse gradients.
+        MIN_STD_SEED_F  = 0.05   # range [0, 1]
+        MIN_STD_ANIM_F  = 0.05   # range [0, 1]
+        MIN_STD_WEED    = 0.5    # range [0, 10]
+        MIN_STD_MAINT   = 1.15   # range [0, 23]
+        MIN_STD_PANIC   = 1.15   # range [0, 23]
+        MIN_STD_SEED_M  = 0.25   # range [0, 5]
+        MIN_STD_LAND_B  = 100.0  # range [0, 2000]
 
         def __init__(self, input_dim=FEATURE_DIM, output_dim=ACTION_DIM):
             super().__init__()
@@ -62,92 +76,150 @@ if HAS_TORCH:
         def forward(self, x):
             return self.net(x)
 
+        def get_distributions(self, logits):
+            """Build all action distributions from raw network logits.
+
+            Returns a dict of named distributions, grouped into two lists
+            for separate entropy accounting:
+              - discrete_dists: list of (name, dist) for discrete heads
+              - continuous_dists: list of (name, dist) for continuous heads
+
+            This is the single source of truth for distribution construction;
+            both ``get_action`` and the training loop must use this method so
+            distribution parameters (especially min-std) stay in sync.
+            """
+            # --- Discrete heads ---
+            dist_land = Bernoulli(torch.sigmoid(logits[..., 0]))
+            dist_hire = Categorical(logits=logits[..., 1:14])
+            dist_sell = Bernoulli(torch.sigmoid(logits[..., 14:23]))
+            dist_seed_c = Categorical(logits=logits[..., 23:28])
+            dist_anim_t = Categorical(logits=logits[..., 29:32])
+
+            discrete_dists = [
+                ("land", dist_land),
+                ("hire", dist_hire),
+                ("sell", dist_sell),
+                ("seed_c", dist_seed_c),
+                ("anim_t", dist_anim_t),
+            ]
+
+            # --- Continuous heads (per-head min-std) ---
+            dist_seed_f = Normal(
+                torch.sigmoid(logits[..., 28]),
+                torch.nn.functional.softplus(logits[..., 38]).clamp(self.MIN_STD_SEED_F, 1.0),
+            )
+            dist_anim_f = Normal(
+                torch.sigmoid(logits[..., 32]),
+                torch.nn.functional.softplus(logits[..., 39]).clamp(self.MIN_STD_ANIM_F, 1.0),
+            )
+            dist_weed = Normal(
+                torch.sigmoid(logits[..., 33]) * 10.0,
+                torch.nn.functional.softplus(logits[..., 40]).clamp(self.MIN_STD_WEED, 5.0),
+            )
+            dist_maint = Normal(
+                torch.sigmoid(logits[..., 34]) * 23.0,
+                torch.nn.functional.softplus(logits[..., 41]).clamp(self.MIN_STD_MAINT, 10.0),
+            )
+            dist_panic = Normal(
+                torch.sigmoid(logits[..., 35]) * 23.0,
+                torch.nn.functional.softplus(logits[..., 42]).clamp(self.MIN_STD_PANIC, 10.0),
+            )
+            dist_seed_m = Normal(
+                torch.sigmoid(logits[..., 36]) * 5.0,
+                torch.nn.functional.softplus(logits[..., 43]).clamp(self.MIN_STD_SEED_M, 2.5),
+            )
+            dist_land_b = Normal(
+                torch.sigmoid(logits[..., 37]) * 2000.0,
+                torch.nn.functional.softplus(logits[..., 44]).clamp(self.MIN_STD_LAND_B, 1000.0),
+            )
+
+            continuous_dists = [
+                ("seed_f", dist_seed_f),
+                ("anim_f", dist_anim_f),
+                ("weed", dist_weed),
+                ("maint", dist_maint),
+                ("panic", dist_panic),
+                ("seed_m", dist_seed_m),
+                ("land_b", dist_land_b),
+            ]
+
+            return discrete_dists, continuous_dists
+
         def get_action(self, x, deterministic=False):
             """Returns (sampled_action_dict, log_prob, raw_logits)
             If deterministic=True, returns the mode/mean of distributions.
             """
             logits = self.forward(x)
-            
+            discrete_dists, continuous_dists = self.get_distributions(logits)
+
+            # Unpack discrete distributions
+            dist_land   = discrete_dists[0][1]
+            dist_hire   = discrete_dists[1][1]
+            dist_sell   = discrete_dists[2][1]
+            dist_seed_c = discrete_dists[3][1]
+            dist_anim_t = discrete_dists[4][1]
+
+            # Unpack continuous distributions
+            dist_seed_f = continuous_dists[0][1]
+            dist_anim_f = continuous_dists[1][1]
+            dist_weed   = continuous_dists[2][1]
+            dist_maint  = continuous_dists[3][1]
+            dist_panic  = continuous_dists[4][1]
+            dist_seed_m = continuous_dists[5][1]
+            dist_land_b = continuous_dists[6][1]
+
+            # --- Sample actions ---
             # 1. buy_land (Bernoulli)
-            p_land = torch.sigmoid(logits[..., 0])
-            dist_land = Bernoulli(p_land)
+            p_land = dist_land.probs
             a_land = (p_land > 0.5).float() if deterministic else dist_land.sample()
             lp_land = dist_land.log_prob(a_land)
-            
-            # 2. hire_target (Categorical 0-12 mapping to 1-13 workers)
-            dist_hire = Categorical(logits=logits[..., 1:14])
+
+            # 2. hire_target (Categorical)
             a_hire = torch.argmax(logits[..., 1:14], dim=-1) if deterministic else dist_hire.sample()
             lp_hire = dist_hire.log_prob(a_hire)
-            
+
             # 3. sell_hold (9 independent Bernoullis)
-            p_sell = torch.sigmoid(logits[..., 14:23])
-            dist_sell = Bernoulli(p_sell)
+            p_sell = dist_sell.probs
             a_sell = (p_sell > 0.5).float() if deterministic else dist_sell.sample()
             lp_sell = dist_sell.log_prob(a_sell).sum(dim=-1)
-            
-            # 4. buy_seed_crop (Categorical 0-4)
-            dist_seed_c = Categorical(logits=logits[..., 23:28])
+
+            # 4. buy_seed_crop (Categorical)
             a_seed_c = torch.argmax(logits[..., 23:28], dim=-1) if deterministic else dist_seed_c.sample()
             lp_seed_c = dist_seed_c.log_prob(a_seed_c)
-            
+
             # 5. buy_seed_frac (Normal)
-            mean_seed_f = torch.sigmoid(logits[..., 28])
-            std_seed_f = torch.nn.functional.softplus(logits[..., 38]).clamp(0.01, 1.0)
-            dist_seed_f = Normal(mean_seed_f, std_seed_f)
-            if deterministic:
-                a_seed_f = mean_seed_f
-            else:
-                a_seed_f = dist_seed_f.sample().clamp(0.0, 1.0)
+            a_seed_f = dist_seed_f.mean if deterministic else dist_seed_f.sample().clamp(0.0, 1.0)
             lp_seed_f = dist_seed_f.log_prob(a_seed_f)
-            
-            # 6. buy_animal_type (Categorical 0-2)
-            dist_anim_t = Categorical(logits=logits[..., 29:32])
+
+            # 6. buy_animal_type (Categorical)
             a_anim_t = torch.argmax(logits[..., 29:32], dim=-1) if deterministic else dist_anim_t.sample()
             lp_anim_t = dist_anim_t.log_prob(a_anim_t)
-            
+
             # 7. buy_animal_frac (Normal)
-            mean_anim_f = torch.sigmoid(logits[..., 32])
-            std_anim_f = torch.nn.functional.softplus(logits[..., 39]).clamp(0.01, 1.0)
-            dist_anim_f = Normal(mean_anim_f, std_anim_f)
-            if deterministic:
-                a_anim_f = mean_anim_f
-            else:
-                a_anim_f = dist_anim_f.sample().clamp(0.0, 1.0)
+            a_anim_f = dist_anim_f.mean if deterministic else dist_anim_f.sample().clamp(0.0, 1.0)
             lp_anim_f = dist_anim_f.log_prob(a_anim_f)
-            
+
             # 8. Tactical parameters (Normal distributions)
-            mean_weed = torch.sigmoid(logits[..., 33]) * 10.0
-            std_weed = torch.nn.functional.softplus(logits[..., 40]).clamp(0.01, 5.0)
-            dist_weed = Normal(mean_weed, std_weed)
-            a_weed = mean_weed if deterministic else dist_weed.sample().clamp(0.0, 10.0)
+            a_weed = dist_weed.mean if deterministic else dist_weed.sample().clamp(0.0, 10.0)
             lp_weed = dist_weed.log_prob(a_weed)
-            
-            mean_maint = torch.sigmoid(logits[..., 34]) * 23.0
-            std_maint = torch.nn.functional.softplus(logits[..., 41]).clamp(0.01, 10.0)
-            dist_maint = Normal(mean_maint, std_maint)
-            a_maint = mean_maint if deterministic else dist_maint.sample().clamp(0.0, 23.0)
+
+            a_maint = dist_maint.mean if deterministic else dist_maint.sample().clamp(0.0, 23.0)
             lp_maint = dist_maint.log_prob(a_maint)
-            
-            mean_panic = torch.sigmoid(logits[..., 35]) * 23.0
-            std_panic = torch.nn.functional.softplus(logits[..., 42]).clamp(0.01, 10.0)
-            dist_panic = Normal(mean_panic, std_panic)
-            a_panic = mean_panic if deterministic else dist_panic.sample().clamp(0.0, 23.0)
+
+            a_panic = dist_panic.mean if deterministic else dist_panic.sample().clamp(0.0, 23.0)
             lp_panic = dist_panic.log_prob(a_panic)
-            
-            mean_seed_m = torch.sigmoid(logits[..., 36]) * 5.0
-            std_seed_m = torch.nn.functional.softplus(logits[..., 43]).clamp(0.01, 2.5)
-            dist_seed_m = Normal(mean_seed_m, std_seed_m)
-            a_seed_m = mean_seed_m if deterministic else dist_seed_m.sample().clamp(0.0, 5.0)
+
+            a_seed_m = dist_seed_m.mean if deterministic else dist_seed_m.sample().clamp(0.0, 5.0)
             lp_seed_m = dist_seed_m.log_prob(a_seed_m)
-            
-            mean_land_b = torch.sigmoid(logits[..., 37]) * 2000.0
-            std_land_b = torch.nn.functional.softplus(logits[..., 44]).clamp(1.0, 1000.0)
-            dist_land_b = Normal(mean_land_b, std_land_b)
-            a_land_b = mean_land_b if deterministic else dist_land_b.sample().clamp(0.0, 2000.0)
+
+            a_land_b = dist_land_b.mean if deterministic else dist_land_b.sample().clamp(0.0, 2000.0)
             lp_land_b = dist_land_b.log_prob(a_land_b)
-            
-            total_log_prob = lp_land + lp_hire + lp_sell + lp_seed_c + lp_seed_f + lp_anim_t + lp_anim_f + lp_weed + lp_maint + lp_panic + lp_seed_m + lp_land_b
-            
+
+            total_log_prob = (lp_land + lp_hire + lp_sell + lp_seed_c +
+                              lp_seed_f + lp_anim_t + lp_anim_f +
+                              lp_weed + lp_maint + lp_panic +
+                              lp_seed_m + lp_land_b)
+
             action_dict = {
                 "buy_land": a_land,
                 "hire_target": a_hire,
