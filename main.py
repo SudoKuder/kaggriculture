@@ -463,12 +463,33 @@ def build_market(state, plan=None):
         ("WOOL", shed.get("WOOL", 0) + total_in_inv("WOOL")),
     ]
     sell_hold = plan.get("sell_hold", {})
+    # Per-product sell cap as a fraction of current stock per turn.
+    # Prevents dumping full shed quantities at once (which crashes your
+    # own sell price) while draining inventory fast enough to avoid
+    # shed overflow.  Premium products (above_target > 1, i.e. their
+    # prices crash hard on gluts) get a tighter fraction.
+    _PREMIUM = {"STRAWBERRY", "MELON", "MILK", "WOOL"}
+    # Ramp: days 25-30, relax the cap linearly toward uncapped.
+    # Avoids the day-29 cliff where backed-up inventory dumps all at
+    # once and self-inflicts a price crash with zero runway to recover.
+    RAMP_START_DAY = 25
+    RAMP_END_DAY   = 30
+    if day >= RAMP_END_DAY:
+        sell_frac = 1.0  # uncapped
+    elif day >= RAMP_START_DAY:
+        ramp_frac = (day - RAMP_START_DAY) / (RAMP_END_DAY - RAMP_START_DAY)
+        sell_frac = 0.8 + 0.2 * ramp_frac  # 80% → 100%
+    else:
+        sell_frac = 0.8
+
     for product, qty in sell_candidates:
         if qty <= 0:
             continue
         if sell_hold.get(product) == "hold":
             continue
-        orders.append(["SELL", product, qty])
+        frac = sell_frac * (0.6 if product in _PREMIUM else 1.0)
+        sell_qty = max(1, int(qty * frac))  # always sell at least 1
+        orders.append(["SELL", product, sell_qty])
 
     # ---- BUY-side orders (hires, land, seeds, animals) are gated to hour==0
     # (the day's first turn). The market processes orders every turn, so without

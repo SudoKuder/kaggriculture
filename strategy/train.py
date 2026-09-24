@@ -17,7 +17,6 @@ import math
 from copy import deepcopy
 import glob
 import re
-import gc
 
 import numpy as np
 import torch
@@ -134,6 +133,75 @@ class StrategicTrainingAgent:
         return action
 
 
+class NumpySnapshotAgent:
+    """Lightweight numpy-only opponent for self-play snapshots.
+    
+    Uses ActorNetNumpy for inference (no gradients, no GPU memory).
+    Much cheaper than StrategicTrainingAgent for opponent-only use.
+    
+    NOTE: This agent is intentionally deterministic (argmax/threshold,
+    no sampling) — that's a deliberate tradeoff for memory savings, not
+    a bug.  Self-play opponents don't need exploration noise.
+    """
+
+    def __init__(self, actor_net_numpy, player_id=1):
+        self.actor_net_np = actor_net_numpy
+        self.player_id = player_id
+        self.current_plan = None
+        import main
+        main._strategic_layer = None
+        main.step_counter = 2
+        self._heuristic = main.agent
+
+    def __call__(self, obs, config=None):
+        day = obs.get("day", 0)
+        hour = obs.get("hour", 0)
+
+        if hour == 0:
+            features = extract_features(obs)
+            action_dict = self.actor_net_np.predict(features)
+
+            plan = {}
+            plan["buy_land"] = bool(action_dict["buy_land"] > 0.5)
+            plan["hire_target"] = int(action_dict["hire_target"]) + 1
+
+            PRODUCT_ORDER = ["WHEAT", "CARROT", "TOMATO", "STRAWBERRY", "MELON",
+                             "EGG", "MILK", "WOOL", "FERTILIZER"]
+            sell_hold = {}
+            for i, prod in enumerate(PRODUCT_ORDER):
+                if action_dict["sell_hold"][i] > 0.5:
+                    sell_hold[prod] = "hold"
+                else:
+                    sell_hold[prod] = "sell"
+            plan["sell_hold"] = sell_hold
+
+            CROP_ORDER = ["WHEAT", "CARROT", "TOMATO", "STRAWBERRY", "MELON"]
+            from kaggle_environments.envs.kaggriculture.kaggriculture import CROPS, ANIMALS
+            crop = CROP_ORDER[int(action_dict["buy_seed_crop"])]
+            seed_price = CROPS[crop]["seed"]
+            raw_frac = action_dict["buy_seed_frac"]
+            frac = (raw_frac - 0.6) / 0.4 if raw_frac > 0.6 else 0.0
+            money = obs["farms"][obs["player"]]["money"]
+            qty = int((money * frac) / seed_price) if seed_price > 0 else 0
+            plan["buy_seed"] = {"crop": crop, "qty": qty} if qty > 0 else None
+
+            ANIMAL_ORDER = ["GOOSE", "COW", "SHEEP"]
+            anim = ANIMAL_ORDER[int(action_dict["buy_animal_type"])]
+            raw_anim_frac = action_dict["buy_animal_frac"]
+            frac_anim = (raw_anim_frac - 0.6) / 0.4 if raw_anim_frac > 0.6 else 0.0
+            anim_price = ANIMALS[anim]["cost"]
+            qty_anim = int((money * frac_anim) / anim_price) if anim_price > 0 else 0
+            plan["buy_animal"] = {"type": anim, "qty": qty_anim} if qty_anim > 0 else None
+
+            plan["label"] = "numpy_snapshot"
+            self.current_plan = plan
+
+        import main
+        main.IS_TRAINING = True
+        main._current_plan[obs["player"]] = self.current_plan
+        return self._heuristic(obs)
+
+
 # ---------------------------------------------------------------------------
 # Training Loop
 # ---------------------------------------------------------------------------
@@ -168,7 +236,6 @@ def train_actor_network(
         latest_ckpt = max(checkpoints, key=extract_ep)
         start_episode = extract_ep(latest_ckpt)
         
-    loaded_path = None
     loaded_path = None
     loaded_critic_path = None
     if os.path.exists(final_path):
@@ -220,11 +287,10 @@ def train_actor_network(
         for ckpt in sorted_ckpts:
             ep_num = extract_ep(ckpt)
             if ep_num > 0:
-                snapshot_model = ActorNetTorch(input_dim=FEATURE_DIM).to(device)
                 from strategy.actor_net import load_weights
-                snapshot_model.import_numpy_weights(load_weights(ckpt))
-                snapshot_agent = StrategicTrainingAgent(
-                    actor_net_torch=snapshot_model,
+                snapshot_np = ActorNetNumpy(load_weights(ckpt))
+                snapshot_agent = NumpySnapshotAgent(
+                    actor_net_numpy=snapshot_np,
                     player_id=1,
                 )
                 pool.add_snapshot(snapshot_agent, label=f"ep{ep_num}")
@@ -234,15 +300,13 @@ def train_actor_network(
     # Entropy coefficients with linear annealing.
     # Start high enough to force exploration, decay to a small floor so the
     # policy gradient can dominate once the agent has seen enough diversity.
-    # 0.05 was too high — it drove all discrete heads to maximum entropy
-    # (pure random play, 2% win rate). 0.01 was too low — entropy collapsed
-    # in the first 3k episodes, killing the actor gradient.
-    # Sweet spot: start=0.02, end=0.005, anneal over 30k episodes.
-    ENTROPY_COEFF_DISCRETE_START = 0.02
-    ENTROPY_COEFF_DISCRETE_END   = 0.005
+    # Reduced from 0.02/30k after MIN_STD per-head fix and loss-level clamp
+    # stabilized gradients that previously caused collapse at lower coefficients.
+    ENTROPY_COEFF_DISCRETE_START = 0.015
+    ENTROPY_COEFF_DISCRETE_END   = 0.003
     ENTROPY_COEFF_CONT_START     = 0.002
     ENTROPY_COEFF_CONT_END       = 0.0005
-    ENTROPY_ANNEAL_STEPS         = 30_000   # episodes over which to anneal
+    ENTROPY_ANNEAL_STEPS         = 10_000   # episodes over which to anneal (was 30k)
     # Discount factor for reward-to-go
     GAMMA = 0.99
 
@@ -266,6 +330,13 @@ def train_actor_network(
     running_ent_seed_c = 0.0
     running_ent_anim_t = 0.0
     running_cont_entropy = 0.0
+    
+    # Rolling win-rate tracking per opponent category
+    FIXED_LABELS = {"starter", "heuristic", "noisy_0.1", "noisy_0.2", "passive", "top_player_script"}
+    batch_wins_fixed = 0
+    batch_total_fixed = 0
+    batch_wins_self = 0
+    batch_total_self = 0
     
     loss_count = 0
     last_buffer_size = 0
@@ -300,19 +371,15 @@ def train_actor_network(
         m0 = final_obs["farms"][0]["money"]
         m1 = final_obs["farms"][1]["money"]
         
-        # Reward Shaping: Give credit for unsold seeds for both players
-        from kaggle_environments.envs.kaggriculture.kaggriculture import CROPS
-        priv0 = env.state[0]["observation"].get("private", {})
-        asset_value0 = sum(qty * CROPS[crop]["seed"] for crop, qty in priv0.get("seeds", {}).items())
-        
-        priv1 = env.state[1]["observation"].get("private", {})
-        asset_value1 = sum(qty * CROPS[crop]["seed"] for crop, qty in priv1.get("seeds", {}).items())
-        
-        money_delta = (m0 + asset_value0) - (m1 + asset_value1)
+        # Use raw bank money delta — the competition scores bank money only.
+        # The panic-liquidation logic in main.py already converts inventory
+        # to cash on day 29-30, and leftover seeds score zero.
+        money_delta = m0 - m1
 
-        # Discounted returns: assign each day's decision a discounted
-        # version of the final money_delta so earlier actions get less
-        # credit, reducing variance across long episodes (~29 decisions).
+        # Discounted returns: store plain money_delta * discount.
+        # The sign-blended log-transform is applied exactly once at batch
+        # time (see batch_r_raw below) — NOT here, to avoid double
+        # log-transforming.
         n_transitions = len(agent0.recorded_transitions)
         for step_idx, (feat, act) in enumerate(agent0.recorded_transitions):
             discount = GAMMA ** (n_transitions - 1 - step_idx)
@@ -321,6 +388,18 @@ def train_actor_network(
             data_targets.append(money_delta * discount)
 
         total_games += 1
+        
+        # Track win rates by opponent category
+        won = money_delta > 0
+        pool.report_result(opp_label, won)  # update challenge-based sampling
+        if opp_label in FIXED_LABELS:
+            batch_total_fixed += 1
+            if won:
+                batch_wins_fixed += 1
+        else:
+            batch_total_self += 1
+            if won:
+                batch_wins_self += 1
 
         # Train every 10 episodes on a fresh on-policy batch, then clear it
         if total_games > 0 and total_games % 10 == 0:
@@ -414,8 +493,16 @@ def train_actor_network(
                     dist_land_b.entropy()
                 )
                 
+                # Sign-blended log-transform applied exactly once here.
+                # data_targets[i] = money_delta * discount (raw scale).
+                # sign_bonus pushes gradient toward correct win/loss sign
+                # in close games, without being crushed by the log.
+                def _blend_target(raw):
+                    sign_bonus = 1.0 if raw > 0 else (-1.0 if raw < 0 else 0.0)
+                    return 0.7 * _log_money(raw) + 0.3 * sign_bonus
+
                 batch_r_raw = torch.tensor(
-                    np.array([_log_money(data_targets[i]) for i in indices]),
+                    np.array([_blend_target(data_targets[i]) for i in indices]),
                     dtype=torch.float32,
                 ).to(device)
 
@@ -531,6 +618,11 @@ def train_actor_network(
             os.makedirs(log_dir, exist_ok=True)
             jsonl_path = os.path.join(log_dir, "training_metrics.jsonl")
             
+            # Compute batch win rates
+            wr_fixed = batch_wins_fixed / max(1, batch_total_fixed)
+            wr_self = batch_wins_self / max(1, batch_total_self)
+            wr_overall = (batch_wins_fixed + batch_wins_self) / max(1, batch_total_fixed + batch_total_self)
+            
             log_entry = {
                 "episode": episode + 1,
                 "loss": avg_loss,
@@ -548,11 +640,20 @@ def train_actor_network(
                 "clamp_frac": avg_clamp_frac,
                 "discrete_entropy": avg_ent_land + avg_ent_hire + avg_ent_sell + avg_ent_seed_c + avg_ent_anim_t,
                 "continuous_entropy": avg_cont_entropy,
+                "win_rate_fixed": wr_fixed,
+                "win_rate_self": wr_self,
+                "win_rate_overall": wr_overall,
             }
             
             import json
             with open(jsonl_path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(log_entry) + "\n")
+            
+            # Reset batch win-rate counters
+            batch_wins_fixed = 0
+            batch_total_fixed = 0
+            batch_wins_self = 0
+            batch_total_self = 0
                 
             running_loss = 0.0
             running_actor_loss = 0.0
@@ -569,7 +670,6 @@ def train_actor_network(
             running_ent_anim_t = 0.0
             running_cont_entropy = 0.0
             loss_count = 0
-            gc.collect()
 
         if (episode + 1) % eval_interval == 0:
             if verbose:
@@ -592,13 +692,8 @@ def train_actor_network(
                         e_m0 = e_final_obs["farms"][0]["money"]
                         e_m1 = e_final_obs["farms"][1]["money"]
                         
-                        # Reward shaping for eval
-                        e_priv0 = eval_env.state[0]["observation"].get("private", {})
-                        e_asset_value0 = sum(qty * CROPS[crop]["seed"] for crop, qty in e_priv0.get("seeds", {}).items())
-                        e_priv1 = eval_env.state[1]["observation"].get("private", {})
-                        e_asset_value1 = sum(qty * CROPS[crop]["seed"] for crop, qty in e_priv1.get("seeds", {}).items())
-                        
-                        md = (e_m0 + e_asset_value0) - (e_m1 + e_asset_value1)
+                        # Raw bank money delta (matching competition scoring)
+                        md = e_m0 - e_m1
                         eval_money_deltas.append(md)
                         if md > 0:
                             wins += 1
@@ -636,11 +731,10 @@ def train_actor_network(
             if verbose:
                 print(f"  -> Checkpoint saved: {ckpt_path}")
                 
-            # Add snapshot to opponent pool
-            snapshot_model = ActorNetTorch(input_dim=FEATURE_DIM).to(device)
-            snapshot_model.import_numpy_weights(layers)
-            snapshot_agent = StrategicTrainingAgent(
-                actor_net_torch=snapshot_model,
+            # Add snapshot to opponent pool (numpy-only, no gradients needed)
+            snapshot_np = ActorNetNumpy(layers)
+            snapshot_agent = NumpySnapshotAgent(
+                actor_net_numpy=snapshot_np,
                 player_id=1,
             )
             pool.add_snapshot(snapshot_agent, label=f"ep{episode + 1}")

@@ -63,32 +63,41 @@ def smoke_test():
     assert features.shape == (64,), f"Expected (64,), got {features.shape}"
     print("   [OK] Feature extraction OK")
 
-    # 2. Candidate generation
-    print("\n2. Testing candidate generation...")
-    from strategy.candidates import generate_candidates
-    candidates = generate_candidates(obs)
-    print(f"   Generated {len(candidates)} candidates: "
-          f"{[c['label'] for c in candidates]}")
-    assert len(candidates) >= 2, "Need at least 2 candidates"
-    assert candidates[0]["label"] == "baseline", "First candidate must be baseline"
-    print("   [OK] Candidate generation OK")
-
-    # 3. Actor network
-    print("\n3. Testing actor network...")
+    # 2. Actor network (forward pass + action sampling)
+    print("\n2. Testing actor network...")
     import torch
     model = ActorNetTorch()
     x = torch.randn(1, 64)
     y = model(x)
     print(f"   PyTorch forward: input={x.shape} -> output={y.shape}")
 
-    # Numpy equivalence
+    # Test get_action returns all expected keys
+    action_dict, log_prob, logits = model.get_action(
+        torch.tensor(features).unsqueeze(0), deterministic=True
+    )
+    expected_keys = {
+        "buy_land", "hire_target", "sell_hold", "buy_seed_crop",
+        "buy_seed_frac", "buy_animal_type", "buy_animal_frac",
+        "weed_penalty", "maint_water_hour", "panic_drop_hour",
+        "seed_threshold_mult", "land_unlock_buffer",
+    }
+    assert set(action_dict.keys()) == expected_keys, (
+        f"Missing keys: {expected_keys - set(action_dict.keys())}"
+    )
+    print(f"   get_action: {len(action_dict)} heads, log_prob shape={log_prob.shape}")
+    print("   [OK] Actor network OK")
+
+    # 3. Numpy equivalence
+    print("\n3. Testing numpy inference equivalence...")
     vnet_np = torch_to_numpy(model)
     action_np = vnet_np.predict(features)
-    action_dict, _, _ = model.get_action(torch.tensor(features).unsqueeze(0), deterministic=True)
-    diff = abs(action_np["buy_seed_frac"] - torch.sigmoid(model(torch.tensor(features).unsqueeze(0))[..., 21]).item())
-    print(f"   Numpy forward: val={action_np['buy_seed_frac']:.4f}, PyTorch: diff={diff:.6f}")
+    diff = abs(
+        action_np["buy_seed_frac"]
+        - torch.sigmoid(model(torch.tensor(features).unsqueeze(0))[..., 28]).item()
+    )
+    print(f"   Numpy forward: val={action_np['buy_seed_frac']:.4f}, PyTorch diff={diff:.6f}")
     assert diff < 1e-4, f"Numpy/PyTorch mismatch: {diff}"
-    print("   [OK] Actor network OK")
+    print("   [OK] Numpy equivalence OK")
 
     # 4. Weight save/load
     print("\n4. Testing weight serialization...")
@@ -137,10 +146,6 @@ def main():
         help="Learning rate (default: 0.001)"
     )
     parser.add_argument(
-        "--rollout-days", type=int, default=2,
-        help="Rollout depth in days (default: 2)"
-    )
-    parser.add_argument(
         "--checkpoint-interval", type=int, default=100,
         help="Save checkpoint every N episodes (default: 100)"
     )
@@ -164,7 +169,6 @@ def main():
     print(f"Episodes:   {args.episodes}")
     print(f"Batch size: {args.batch_size}")
     print(f"LR:         {args.lr}")
-    print(f"Rollout:    {args.rollout_days} days")
     print(f"Output:     {args.output_dir}")
     print("=" * 60)
 

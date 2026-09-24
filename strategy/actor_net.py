@@ -16,8 +16,13 @@ try:
 except ImportError:
     HAS_TORCH = False
 
-# 64 state features (without the 14-dim plan encoding)
-FEATURE_DIM = 64
+# Import FEATURE_DIM from the single source of truth; fall back to 64
+# for Kaggle submission context where strategy package may not exist.
+try:
+    from strategy.features import FEATURE_DIM
+except ImportError:
+    FEATURE_DIM = 64
+
 ACTION_DIM = 45
 
 # Output dimension indices:

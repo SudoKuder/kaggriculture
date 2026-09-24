@@ -1,4 +1,8 @@
-# Kaggriculture Agent Architecture
+> **⚠️ DEPRECATED:** This document describes the old candidate-plan/value-network architecture.
+> The current implementation uses an actor-critic REINFORCE policy with structured action heads.
+> See `train_explanation.md` and `actor_net_explanation.md` for the current architecture.
+
+# Kaggriculture Agent Architecture (DEPRECATED)
 
 The agent is built using a **hybrid architecture** that combines a hard-coded, rule-based tactical layer with a neural network-driven strategic layer. 
 

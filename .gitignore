@@ -11,3 +11,4 @@ __pycache__/
 *.md
 *.png
 *pngz
+strategy_checkpoints_v*/

@@ -160,8 +160,17 @@ def extract_features(obs):
     for shop_type in SHOP_TYPES:
         feats.append(shops.count(shop_type) / 3.0)
 
-    # --- Pad to 64 (original state dimension) ---
-    while len(feats) < 64:
+    # --- Relative score features (3) — use the remaining slots ---
+    own_money = me.get("money", 0)
+    opp_money = opp.get("money", 0)
+    money_diff = own_money - opp_money
+    money_sum = own_money + opp_money
+    feats.append(_log_money(money_diff))                                  # log-compressed delta
+    feats.append(money_diff / max(money_sum, 1.0))                        # normalized advantage ratio [-1, 1]
+    feats.append(1.0 if own_money > opp_money else 0.0)                   # binary "am I winning?"
+
+    # --- Pad to FEATURE_DIM if any slots remain ---
+    while len(feats) < FEATURE_DIM:
         feats.append(0.0)
 
-    return np.array(feats[:64], dtype=np.float32)
+    return np.array(feats[:FEATURE_DIM], dtype=np.float32)
